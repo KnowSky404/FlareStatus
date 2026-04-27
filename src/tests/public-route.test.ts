@@ -8,9 +8,15 @@ interface PublicStatusPayload {
   summary: { status: string };
   announcements: unknown[];
   services: Array<{
+    id: string;
     slug: string;
+    name: string;
+    status: string;
     components: Array<{
+      id: string;
+      serviceId: string;
       slug: string;
+      name: string;
       displayStatus: string;
     }>;
   }>;
@@ -127,16 +133,32 @@ describe("public status route", () => {
       generatedAt: "2026-04-27T10:00:00.000Z",
       summary: { status: "degraded" },
       announcements: [],
+      services: [
+        {
+          id: "svc_1",
+          slug: "sub2api",
+          name: "Sub2API",
+          status: "degraded",
+          components: [
+            {
+              id: "cmp_1",
+              serviceId: "svc_1",
+              slug: "sub2api-health",
+              name: "Sub2API Health",
+              displayStatus: "degraded",
+            },
+          ],
+        },
+      ],
     });
     expect(payload.services).toHaveLength(1);
-    expect(payload.services[0]).toMatchObject({
-      slug: "sub2api",
-    });
+    expect(payload.services[0]).toHaveProperty("id");
+    expect(payload.services[0]).toHaveProperty("name");
+    expect(payload.services[0]).toHaveProperty("status");
     expect(payload.services[0]?.components).toHaveLength(1);
-    expect(payload.services[0]?.components[0]).toMatchObject({
-      slug: "sub2api-health",
-      displayStatus: "degraded",
-    });
+    expect(payload.services[0]?.components[0]).toHaveProperty("id");
+    expect(payload.services[0]?.components[0]).toHaveProperty("serviceId");
+    expect(payload.services[0]?.components[0]).toHaveProperty("name");
   });
 
   it("returns the full fallback contract when KV is empty", async () => {

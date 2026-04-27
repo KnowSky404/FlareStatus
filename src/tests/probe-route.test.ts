@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../lib/env";
 import { recomputePublicStatus } from "../lib/status-engine";
 import worker from "../worker";
@@ -117,7 +117,14 @@ describe("probe ingest", () => {
     recomputePublicStatusMock.mockResolvedValue(undefined as never);
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("accepts a signed report payload, stores its summary, and rebuilds public status", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T10:05:00.000Z"));
+
     const { env, dbCalls } = createEnv({
       expectedBindings: [
         "docker-probe",
@@ -145,7 +152,7 @@ describe("probe ingest", () => {
     expect(recomputePublicStatusMock).toHaveBeenCalledWith(
       env.DB,
       env.STATUS_SNAPSHOTS,
-      validPayload.checkedAt,
+      "2026-04-27T10:05:00.000Z",
     );
   });
 
@@ -177,7 +184,72 @@ describe("probe ingest", () => {
     expect(recomputePublicStatusMock).toHaveBeenCalledWith(
       env.DB,
       env.STATUS_SNAPSHOTS,
-      validPayload.checkedAt,
+      expect.any(String),
+    );
+  });
+
+  it("accepts a report when summary is omitted and stores an empty summary value", async () => {
+    const { env, dbCalls } = createEnv({
+      expectedBindings: [
+        "docker-probe",
+        validPayload.status,
+        validPayload.latencyMs,
+        "",
+        validPayload.checkedAt,
+        validPayload.componentSlug,
+      ],
+    });
+
+    const { summary: _summary, ...payloadWithoutSummary } = validPayload;
+    const response = await worker.fetch(
+      createRequest(JSON.stringify(payloadWithoutSummary)),
+      env,
+      {} as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ accepted: true });
+    expect(dbCalls).toEqual({
+      prepareCalled: true,
+      bindCalled: true,
+      runCalled: true,
+    });
+  });
+
+  it("returns 202 after a successful insert even when recompute fails", async () => {
+    const { env, dbCalls } = createEnv({
+      expectedBindings: [
+        "docker-probe",
+        validPayload.status,
+        validPayload.latencyMs,
+        validPayload.summary,
+        validPayload.checkedAt,
+        validPayload.componentSlug,
+      ],
+    });
+    const error = new Error("kv write failed");
+    const consoleErrorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    recomputePublicStatusMock.mockRejectedValue(error);
+
+    const response = await worker.fetch(
+      createRequest(JSON.stringify(validPayload)),
+      env,
+      {} as ExecutionContext,
+    );
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ accepted: true });
+    expect(dbCalls).toEqual({
+      prepareCalled: true,
+      bindCalled: true,
+      runCalled: true,
+    });
+    expect(recomputePublicStatusMock).toHaveBeenCalledTimes(1);
+    expect(consoleErrorSpy).toHaveBeenCalledWith(
+      "probe ingest recompute failed",
+      error,
     );
   });
 

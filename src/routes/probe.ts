@@ -105,7 +105,13 @@ export async function handleProbeReport(
     return new Response("component not found", { status: 404 });
   }
 
-  await recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, payload.checkedAt);
+  const nowIso = new Date().toISOString();
+
+  try {
+    await recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso);
+  } catch (error) {
+    console.error("probe ingest recompute failed", error);
+  }
 
   return Response.json({ accepted: true }, { status: 202 });
 }
