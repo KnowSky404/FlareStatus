@@ -2,6 +2,20 @@
   "name": "flarestatus",
   "main": "src/worker.ts",
   "compatibility_date": "2026-04-27",
+  "kv_namespaces": [
+    {
+      "binding": "STATUS_SNAPSHOTS",
+      "id": "PLACEHOLDER_KV_NAMESPACE_ID"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flarestatus",
+      "database_id": "PLACEHOLDER_D1_DATABASE_ID",
+      "preview_database_id": "DB"
+    }
+  ],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS"

@@ -1,0 +1,58 @@
+{
+  "services": [
+    {
+      "id": "svc_sub2api",
+      "slug": "sub2api",
+      "name": "Sub2API",
+      "description": "Primary API platform and supporting infrastructure.",
+      "sortOrder": 10,
+      "components": [
+        {
+          "id": "cmp_sub2api_public_api",
+          "slug": "sub2api-public-api",
+          "name": "Public API",
+          "description": "Public HTTPS API used by client applications.",
+          "probeType": "http",
+          "isCritical": true,
+          "sortOrder": 10
+        },
+        {
+          "id": "cmp_sub2api_postgres",
+          "slug": "sub2api-postgres",
+          "name": "Postgres",
+          "description": "Core transactional database for API requests.",
+          "probeType": "postgres",
+          "isCritical": true,
+          "sortOrder": 20
+        }
+      ]
+    },
+    {
+      "id": "svc_codex",
+      "slug": "codex",
+      "name": "Codex",
+      "description": "Developer-facing services for the Codex workflow.",
+      "sortOrder": 20,
+      "components": [
+        {
+          "id": "cmp_codex_web",
+          "slug": "codex-web",
+          "name": "Codex Web",
+          "description": "Primary web interface for Codex users.",
+          "probeType": "http",
+          "isCritical": true,
+          "sortOrder": 10
+        },
+        {
+          "id": "cmp_codex_cli_api",
+          "slug": "codex-cli-api",
+          "name": "Codex CLI API",
+          "description": "API endpoint used by the Codex CLI.",
+          "probeType": "synthetic-http",
+          "isCritical": false,
+          "sortOrder": 20
+        }
+      ]
+    }
+  ]
+}
