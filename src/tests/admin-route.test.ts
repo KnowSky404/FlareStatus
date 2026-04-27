@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../lib/env";
 import * as statusEngineModule from "../lib/status-engine";
 import worker from "../worker";
@@ -57,6 +57,15 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+beforeEach(() => {
+  recomputePublicStatus.mockResolvedValue({
+    generatedAt: "2026-04-27T00:00:00.000Z",
+    summary: { status: "operational" },
+    announcements: [],
+    services: [],
+  });
+});
+
 describe("admin override route", () => {
   it("rejects unauthorized requests", async () => {
     const request = new Request("https://flarestatus.test/api/admin/overrides", {
@@ -106,6 +115,51 @@ describe("admin override route", () => {
         targetSlug: 42,
         overrideStatus: "broken",
         message: null,
+      }),
+    });
+
+    const response = await worker.fetch(request, createEnv(), createCtx());
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
+  it("returns 400 for invalid override timestamps", async () => {
+    const request = new Request("https://flarestatus.test/api/admin/overrides", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-admin-token",
+      },
+      body: JSON.stringify({
+        targetType: "component",
+        targetSlug: "sub2api-public-api",
+        overrideStatus: "degraded",
+        message: "Increased latency under investigation",
+        startsAt: "2026-04-27T08:00:00Z",
+      }),
+    });
+
+    const response = await worker.fetch(request, createEnv(), createCtx());
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
+  it("returns 400 when an override window is reversed or zero-length", async () => {
+    const request = new Request("https://flarestatus.test/api/admin/overrides", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-admin-token",
+      },
+      body: JSON.stringify({
+        targetType: "component",
+        targetSlug: "sub2api-public-api",
+        overrideStatus: "degraded",
+        message: "Increased latency under investigation",
+        startsAt: "2026-04-27T08:00:00.000Z",
+        endsAt: "2026-04-27T08:00:00.000Z",
       }),
     });
 
@@ -220,6 +274,60 @@ describe("admin override route", () => {
     );
   });
 
+  it("returns 201 after an override insert even if recompute fails", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T08:00:00.000Z"));
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("override-123");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const waitUntil = vi.fn(async (promise: Promise<unknown>) => {
+      await promise;
+    });
+    recomputePublicStatus.mockRejectedValueOnce(new Error("kv unavailable"));
+
+    const request = new Request("https://flarestatus.test/api/admin/overrides", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer test-admin-token",
+      },
+      body: JSON.stringify({
+        targetType: "component",
+        targetSlug: "sub2api-public-api",
+        overrideStatus: "degraded",
+        message: "Increased latency under investigation",
+      }),
+    });
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(OVERRIDE_SQL);
+
+        return {
+          bind: () => ({
+            run: async () => ({ meta: { changes: 1 } }),
+          }),
+        } as D1PreparedStatement;
+      },
+    });
+    const ctx = {
+      waitUntil,
+      passThroughOnException() {},
+      props: {},
+    } satisfies ExecutionContext;
+
+    const response = await worker.fetch(request, env, ctx);
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toEqual({ created: true });
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      "failed to recompute public status after admin override insert",
+      expect.any(Error),
+    );
+  });
+
   it("stores an announcement and recomputes the public snapshot", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T08:30:00.000Z"));
@@ -282,5 +390,54 @@ describe("admin override route", () => {
       env.STATUS_SNAPSHOTS,
       "2026-04-27T08:30:00.000Z",
     );
+  });
+
+  it("returns 400 for invalid announcement timestamps", async () => {
+    const request = new Request(
+      "https://flarestatus.test/api/admin/announcements",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-admin-token",
+        },
+        body: JSON.stringify({
+          title: "Scheduled maintenance",
+          body: "API traffic may be intermittently unavailable.",
+          statusLevel: "partial_outage",
+          startsAt: "2026-04-27T08:30:00.000+00:00",
+        }),
+      },
+    );
+
+    const response = await worker.fetch(request, createEnv(), createCtx());
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
+  it("returns 400 when an announcement window is reversed", async () => {
+    const request = new Request(
+      "https://flarestatus.test/api/admin/announcements",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-admin-token",
+        },
+        body: JSON.stringify({
+          title: "Scheduled maintenance",
+          body: "API traffic may be intermittently unavailable.",
+          statusLevel: "partial_outage",
+          startsAt: "2026-04-27T09:30:00.000Z",
+          endsAt: "2026-04-27T09:00:00.000Z",
+        }),
+      },
+    );
+
+    const response = await worker.fetch(request, createEnv(), createCtx());
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
   });
 });

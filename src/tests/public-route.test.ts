@@ -46,7 +46,34 @@ interface PublicStatusPayload {
   }>;
 }
 
-function createEnv(snapshot?: unknown): Env {
+function createEnv(
+  input:
+    | unknown
+    | {
+        snapshot?: unknown;
+        db?: D1Database;
+        kvPut?: (key: string, value: string) => Promise<void>;
+      } = {},
+): Env {
+  if (input === undefined) {
+    input = {};
+  }
+
+  const options =
+    input &&
+    typeof input === "object" &&
+    (Object.keys(input).length === 0 ||
+      "snapshot" in input ||
+      "db" in input ||
+      "kvPut" in input)
+      ? (input as {
+          snapshot?: unknown;
+          db?: D1Database;
+          kvPut?: (key: string, value: string) => Promise<void>;
+        })
+      : { snapshot: input };
+  const { snapshot, db, kvPut } = options;
+
   return {
     ASSETS: ({
       fetch: async (_request) =>
@@ -54,7 +81,7 @@ function createEnv(snapshot?: unknown): Env {
           headers: { "content-type": "text/html; charset=utf-8" },
         }),
     } as Fetcher),
-    DB: {} as D1Database,
+    DB: db ?? ({} as D1Database),
     STATUS_SNAPSHOTS: ({
       get: async (key: string, options?: KVNamespaceGetOptions<"json">) => {
         expect(key).toBe("public:current");
@@ -62,6 +89,7 @@ function createEnv(snapshot?: unknown): Env {
 
         return snapshot ?? null;
       },
+      put: kvPut,
     } as KVNamespace),
     PROBE_API_TOKEN: "probe-token",
     ADMIN_API_TOKEN: "admin-token",
@@ -235,6 +263,7 @@ function createTimedWindowDb({
 
 beforeEach(() => {
   vi.resetAllMocks();
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
   listServicesWithComponents.mockResolvedValue({
     services: [createServiceRow()],
     components: [createComponentRow()],
@@ -353,6 +382,54 @@ describe("public status route", () => {
     expect(payload.summary).toEqual({ status: "operational" });
     expect(payload.announcements).toEqual([]);
     expect(payload.services).toEqual([]);
+  });
+
+  it("recomputes timed windows on public reads before falling back to KV", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T10:45:00.000Z"));
+    const kvPut = vi.fn(async () => undefined);
+
+    const env = createEnv({
+      snapshot: {
+        generatedAt: "2026-04-27T10:00:00.000Z",
+        summary: { status: "operational" },
+        announcements: [],
+        services: [],
+      },
+      db: createTimedWindowDb({
+        overrides: [],
+        announcements: [
+          createAnnouncementRow({
+            id: "ann_future",
+            title: "Scheduled maintenance",
+            body: "API traffic may be intermittently unavailable.",
+            starts_at: "2026-04-27T10:30:00.000Z",
+            ends_at: "2026-04-27T11:30:00.000Z",
+            created_at: "2026-04-27T10:15:00.000Z",
+          }),
+        ],
+      }),
+      kvPut,
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/public/status"),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      generatedAt: "2026-04-27T10:45:00.000Z",
+      announcements: [
+        {
+          id: "ann_future",
+          title: "Scheduled maintenance",
+          body: "API traffic may be intermittently unavailable.",
+        },
+      ],
+    });
+    expect(kvPut).toHaveBeenCalledTimes(1);
   });
 });
 

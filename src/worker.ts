@@ -12,11 +12,11 @@ const worker = {
     }
 
     if (matchesRoute(request, "POST", "/api/admin/overrides")) {
-      return handleAdminOverride(request, env);
+      return handleAdminOverride(request, env, ctx);
     }
 
     if (matchesRoute(request, "POST", "/api/admin/announcements")) {
-      return handleAdminAnnouncement(request, env);
+      return handleAdminAnnouncement(request, env, ctx);
     }
 
     if (matchesRoute(request, "GET", "/api/public/status")) {

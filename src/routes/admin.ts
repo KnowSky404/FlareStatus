@@ -26,12 +26,44 @@ const ADMIN_OVERRIDE_STATUSES = new Set([
   "partial_outage",
   "major_outage",
 ]);
+const ISO_UTC_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 function hasOptionalActiveWindow(candidate: Record<string, unknown>) {
   return (
     (candidate.startsAt === undefined || typeof candidate.startsAt === "string") &&
     (candidate.endsAt === undefined || typeof candidate.endsAt === "string")
   );
+}
+
+function isStrictIsoUtcTimestamp(value: string) {
+  if (!ISO_UTC_TIMESTAMP_PATTERN.test(value)) {
+    return false;
+  }
+
+  return new Date(value).toISOString() === value;
+}
+
+function hasValidActiveWindow({
+  startsAt,
+  endsAt,
+}: {
+  startsAt?: string;
+  endsAt?: string;
+}) {
+  if (startsAt !== undefined && !isStrictIsoUtcTimestamp(startsAt)) {
+    return false;
+  }
+
+  if (endsAt !== undefined && !isStrictIsoUtcTimestamp(endsAt)) {
+    return false;
+  }
+
+  if (startsAt !== undefined && endsAt !== undefined && endsAt <= startsAt) {
+    return false;
+  }
+
+  return true;
 }
 
 function isAdminOverridePayload(payload: unknown): payload is AdminOverridePayload {
@@ -90,9 +122,26 @@ async function parseAdminPayload(request: Request, env: Env) {
   }
 }
 
+function schedulePublicStatusRecompute(
+  ctx: ExecutionContext,
+  env: Env,
+  nowIso: string,
+  source: "admin override" | "admin announcement",
+) {
+  ctx.waitUntil(
+    recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso).catch((error) => {
+      console.error(
+        `failed to recompute public status after ${source} insert`,
+        error,
+      );
+    }),
+  );
+}
+
 export async function handleAdminOverride(
   request: Request,
   env: Env,
+  ctx: ExecutionContext,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
 
@@ -103,6 +152,15 @@ export async function handleAdminOverride(
   const payload = parsed.payload;
 
   if (!isAdminOverridePayload(payload)) {
+    return new Response("invalid payload", { status: 400 });
+  }
+
+  if (
+    !hasValidActiveWindow({
+      startsAt: payload.startsAt,
+      endsAt: payload.endsAt,
+    })
+  ) {
     return new Response("invalid payload", { status: 400 });
   }
 
@@ -122,7 +180,7 @@ export async function handleAdminOverride(
     return new Response("target not found", { status: 404 });
   }
 
-  await recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso);
+  schedulePublicStatusRecompute(ctx, env, nowIso, "admin override");
 
   return Response.json({ created: true }, { status: 201 });
 }
@@ -130,6 +188,7 @@ export async function handleAdminOverride(
 export async function handleAdminAnnouncement(
   request: Request,
   env: Env,
+  ctx: ExecutionContext,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
 
@@ -140,6 +199,15 @@ export async function handleAdminAnnouncement(
   const payload = parsed.payload;
 
   if (!isAdminAnnouncementPayload(payload)) {
+    return new Response("invalid payload", { status: 400 });
+  }
+
+  if (
+    !hasValidActiveWindow({
+      startsAt: payload.startsAt,
+      endsAt: payload.endsAt,
+    })
+  ) {
     return new Response("invalid payload", { status: 400 });
   }
 
@@ -154,7 +222,7 @@ export async function handleAdminAnnouncement(
     createdAt: nowIso,
   });
 
-  await recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso);
+  schedulePublicStatusRecompute(ctx, env, nowIso, "admin announcement");
 
   return Response.json({ created: true }, { status: 201 });
 }
