@@ -90,6 +90,53 @@ export interface AvailabilityRollupRow {
   calculated_at: string;
 }
 
+export interface ComponentStatusUpdateRow {
+  id: string;
+  observedStatus: PublicStatus;
+  displayStatus: PublicStatus;
+}
+
+export interface ServiceStatusUpdateRow {
+  id: string;
+  status: PublicStatus;
+}
+
+export interface AvailabilitySlot {
+  window: string;
+  availabilityPercent: number;
+}
+
+export interface PublicSnapshotAnnouncement {
+  id: string;
+  title: string;
+  body: string;
+}
+
+export interface PublicSnapshotComponent {
+  id: string;
+  serviceId: string;
+  name: string;
+  displayStatus: PublicStatus;
+  slug?: string;
+  availability?: AvailabilitySlot[];
+}
+
+export interface PublicSnapshotService {
+  id: string;
+  slug: string;
+  name: string;
+  status: PublicStatus;
+  availability?: AvailabilitySlot[];
+  components: PublicSnapshotComponent[];
+}
+
+export interface PublicSnapshot {
+  generatedAt: string;
+  summary: { status: PublicStatus };
+  announcements: PublicSnapshotAnnouncement[];
+  services: PublicSnapshotService[];
+}
+
 export interface SeedComponent {
   id: string;
   slug: string;

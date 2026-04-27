@@ -1,3 +1,13 @@
+import type {
+  AnnouncementRow,
+  ComponentRow,
+  ComponentStatusUpdateRow,
+  OverrideRow,
+  ProbeResultRow,
+  ServiceRow,
+  ServiceStatusUpdateRow,
+} from "../types";
+
 export interface CreateOverrideInput {
   targetType: "service" | "component";
   targetSlug: string;
@@ -33,8 +43,101 @@ export async function createOverride(
 }
 
 export async function listServicesWithComponents(db: D1Database) {
-  const services = await db.prepare("SELECT * FROM services ORDER BY sort_order").all();
-  const components = await db.prepare("SELECT * FROM components ORDER BY sort_order").all();
+  const services = await db
+    .prepare("SELECT * FROM services ORDER BY sort_order")
+    .all<ServiceRow>();
+  const components = await db
+    .prepare("SELECT * FROM components ORDER BY sort_order")
+    .all<ComponentRow>();
 
-  return { services: services.results, components: components.results };
+  return {
+    services: services.results,
+    components: components.results,
+  };
+}
+
+export async function listLatestProbeResults(db: D1Database) {
+  const results = await db
+    .prepare(
+      `SELECT pr.*
+       FROM probe_results pr
+       INNER JOIN (
+         SELECT component_id, MAX(checked_at) AS checked_at
+         FROM probe_results
+         GROUP BY component_id
+       ) latest
+         ON latest.component_id = pr.component_id
+        AND latest.checked_at = pr.checked_at`,
+    )
+    .all<ProbeResultRow>();
+
+  return results.results;
+}
+
+export async function listActiveOverrides(db: D1Database, nowIso: string) {
+  const results = await db
+    .prepare(
+      `SELECT *
+       FROM overrides
+       WHERE (starts_at IS NULL OR starts_at <= ?)
+         AND (ends_at IS NULL OR ends_at > ?)
+       ORDER BY created_at DESC`,
+    )
+    .bind(nowIso, nowIso)
+    .all<OverrideRow>();
+
+  return results.results;
+}
+
+export async function listActiveAnnouncements(db: D1Database, nowIso: string) {
+  const results = await db
+    .prepare(
+      `SELECT *
+       FROM announcements
+       WHERE (starts_at IS NULL OR starts_at <= ?)
+         AND (ends_at IS NULL OR ends_at > ?)
+       ORDER BY created_at DESC`,
+    )
+    .bind(nowIso, nowIso)
+    .all<AnnouncementRow>();
+
+  return results.results;
+}
+
+export async function updateComponentStatuses(
+  db: D1Database,
+  rows: ComponentStatusUpdateRow[],
+  nowIso: string,
+) {
+  await Promise.all(
+    rows.map((row) =>
+      db
+        .prepare(
+          `UPDATE components
+           SET observed_status = ?, display_status = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .bind(row.observedStatus, row.displayStatus, nowIso, row.id)
+        .run(),
+    ),
+  );
+}
+
+export async function updateServiceStatuses(
+  db: D1Database,
+  rows: ServiceStatusUpdateRow[],
+  nowIso: string,
+) {
+  await Promise.all(
+    rows.map((row) =>
+      db
+        .prepare(
+          `UPDATE services
+           SET status = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .bind(row.status, nowIso, row.id)
+        .run(),
+    ),
+  );
 }

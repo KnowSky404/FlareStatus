@@ -29,7 +29,15 @@ export function aggregateServiceStatus(
 
   if (
     components.some(
-      (item) => item.isCritical && item.displayStatus !== "operational",
+      (item) => item.isCritical && item.displayStatus === "partial_outage",
+    )
+  ) {
+    return "partial_outage";
+  }
+
+  if (
+    components.some(
+      (item) => item.isCritical && item.displayStatus === "degraded",
     )
   ) {
     return "degraded";

@@ -11,13 +11,13 @@ describe("aggregateServiceStatus", () => {
     expect(result).toBe("major_outage");
   });
 
-  it("returns degraded when a critical component has a partial outage", () => {
+  it("returns partial_outage when a critical component has a partial outage", () => {
     const result = aggregateServiceStatus([
       { isCritical: true, displayStatus: "partial_outage" },
       { isCritical: false, displayStatus: "operational" },
     ]);
 
-    expect(result).toBe("degraded");
+    expect(result).toBe("partial_outage");
   });
 
   it("returns degraded when a critical component is degraded", () => {
