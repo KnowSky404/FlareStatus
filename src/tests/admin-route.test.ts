@@ -1,11 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../lib/env";
+import * as statusEngineModule from "../lib/status-engine";
 import worker from "../worker";
 
-const OVERRIDE_SQL = `INSERT INTO overrides (id, target_type, target_id, override_status, message, created_by, created_at)
-       SELECT ?, ?, id, ?, ?, 'operator', ?
+const OVERRIDE_SQL = `INSERT INTO overrides (id, target_type, target_id, override_status, message, starts_at, ends_at, created_by, created_at)
+       SELECT ?, ?, id, ?, ?, ?, ?, 'operator', ?
        FROM components
        WHERE slug = ?`;
+const ANNOUNCEMENT_SQL = `INSERT INTO announcements (id, title, body, status_level, starts_at, ends_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`;
+
+vi.mock("../lib/status-engine", () => ({
+  recomputePublicStatus: vi.fn(),
+}));
+
+const recomputePublicStatus = vi.mocked(statusEngineModule.recomputePublicStatus);
 
 function createCtx(): ExecutionContext {
   return {
@@ -131,7 +140,9 @@ describe("admin override route", () => {
               expect(params[1]).toBe("component");
               expect(params[2]).toBe("degraded");
               expect(params[3]).toBe("Increased latency under investigation");
-              expect(params[5]).toBe("missing-component");
+              expect(params[4]).toBeNull();
+              expect(params[5]).toBeNull();
+              expect(params[7]).toBe("missing-component");
 
               return { meta: { changes: 0 } };
             },
@@ -162,6 +173,8 @@ describe("admin override route", () => {
         targetSlug: "sub2api-public-api",
         overrideStatus: "degraded",
         message: "Increased latency under investigation",
+        startsAt: "2026-04-27T08:00:00.000Z",
+        endsAt: "2026-04-27T10:00:00.000Z",
       }),
     });
 
@@ -178,6 +191,8 @@ describe("admin override route", () => {
               "component",
               "degraded",
               "Increased latency under investigation",
+              "2026-04-27T08:00:00.000Z",
+              "2026-04-27T10:00:00.000Z",
               "2026-04-27T08:00:00.000Z",
               "sub2api-public-api",
             ]);
@@ -198,5 +213,74 @@ describe("admin override route", () => {
     expect(runCalled).toBe(true);
     expect(response.status).toBe(201);
     await expect(response.json()).resolves.toEqual({ created: true });
+    expect(recomputePublicStatus).toHaveBeenCalledWith(
+      env.DB,
+      env.STATUS_SNAPSHOTS,
+      "2026-04-27T08:00:00.000Z",
+    );
+  });
+
+  it("stores an announcement and recomputes the public snapshot", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T08:30:00.000Z"));
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("announcement-123");
+
+    const request = new Request(
+      "https://flarestatus.test/api/admin/announcements",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer test-admin-token",
+        },
+        body: JSON.stringify({
+          title: "Scheduled maintenance",
+          body: "API traffic may be intermittently unavailable.",
+          statusLevel: "partial_outage",
+          startsAt: "2026-04-27T08:30:00.000Z",
+          endsAt: "2026-04-27T09:30:00.000Z",
+        }),
+      },
+    );
+
+    let runCalled = false;
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(ANNOUNCEMENT_SQL);
+
+        return {
+          bind: (...params: unknown[]) => {
+            expect(params).toEqual([
+              "announcement-123",
+              "Scheduled maintenance",
+              "API traffic may be intermittently unavailable.",
+              "partial_outage",
+              "2026-04-27T08:30:00.000Z",
+              "2026-04-27T09:30:00.000Z",
+              "2026-04-27T08:30:00.000Z",
+            ]);
+
+            return {
+              run: async () => {
+                runCalled = true;
+                return { meta: { changes: 1 } };
+              },
+            };
+          },
+        } as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(request, env, createCtx());
+
+    expect(runCalled).toBe(true);
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toEqual({ created: true });
+    expect(recomputePublicStatus).toHaveBeenCalledWith(
+      env.DB,
+      env.STATUS_SNAPSHOTS,
+      "2026-04-27T08:30:00.000Z",
+    );
   });
 });

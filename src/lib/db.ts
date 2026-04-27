@@ -13,6 +13,8 @@ export interface CreateOverrideInput {
   targetSlug: string;
   overrideStatus: "operational" | "degraded" | "partial_outage" | "major_outage";
   message: string;
+  startsAt?: string;
+  endsAt?: string;
   createdAt: string;
 }
 
@@ -22,8 +24,8 @@ export async function createOverride(
 ) {
   const result = await db
     .prepare(
-      `INSERT INTO overrides (id, target_type, target_id, override_status, message, created_by, created_at)
-       SELECT ?, ?, id, ?, ?, 'operator', ?
+      `INSERT INTO overrides (id, target_type, target_id, override_status, message, starts_at, ends_at, created_by, created_at)
+       SELECT ?, ?, id, ?, ?, ?, ?, 'operator', ?
        FROM ${input.targetType === "service" ? "services" : "components"}
        WHERE slug = ?`,
     )
@@ -32,8 +34,44 @@ export async function createOverride(
       input.targetType,
       input.overrideStatus,
       input.message,
+      input.startsAt ?? null,
+      input.endsAt ?? null,
       input.createdAt,
       input.targetSlug,
+    )
+    .run();
+
+  return {
+    changes: result.meta.changes,
+  };
+}
+
+export interface CreateAnnouncementInput {
+  title: string;
+  body: string;
+  statusLevel: "operational" | "degraded" | "partial_outage" | "major_outage";
+  startsAt?: string;
+  endsAt?: string;
+  createdAt: string;
+}
+
+export async function createAnnouncement(
+  db: D1Database,
+  input: CreateAnnouncementInput,
+) {
+  const result = await db
+    .prepare(
+      `INSERT INTO announcements (id, title, body, status_level, starts_at, ends_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      input.title,
+      input.body,
+      input.statusLevel,
+      input.startsAt ?? null,
+      input.endsAt ?? null,
+      input.createdAt,
     )
     .run();
 

@@ -1,6 +1,6 @@
 import type { Env } from "./lib/env";
 import { matchesRoute } from "./lib/http";
-import { handleAdminOverride } from "./routes/admin";
+import { handleAdminAnnouncement, handleAdminOverride } from "./routes/admin";
 import { handleAssetRequest } from "./routes/assets";
 import { handleProbeReport } from "./routes/probe";
 import { handlePublicStatus } from "./routes/public";
@@ -13,6 +13,10 @@ const worker = {
 
     if (matchesRoute(request, "POST", "/api/admin/overrides")) {
       return handleAdminOverride(request, env);
+    }
+
+    if (matchesRoute(request, "POST", "/api/admin/announcements")) {
+      return handleAdminAnnouncement(request, env);
     }
 
     if (matchesRoute(request, "GET", "/api/public/status")) {
