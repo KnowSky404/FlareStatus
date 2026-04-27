@@ -72,7 +72,7 @@ export async function listLatestProbeResults(db: D1Database) {
            checked_at,
            ROW_NUMBER() OVER (
              PARTITION BY component_id
-             ORDER BY checked_at DESC, id DESC
+             ORDER BY checked_at DESC, rowid DESC
            ) AS probe_rank
          FROM probe_results
        )

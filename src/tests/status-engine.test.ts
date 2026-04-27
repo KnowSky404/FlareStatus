@@ -241,7 +241,7 @@ describe("recomputePublicStatus", () => {
     expect(snapshot.summary.status).toBe("major_outage");
   });
 
-  it("picks a deterministic winner when duplicate latest probe rows exist for one component", async () => {
+  it("keeps the first row when duplicate probe rows share the same checkedAt", async () => {
     listServicesWithComponents.mockResolvedValue({
       services: [createServiceRow()],
       components: [createComponentRow()],

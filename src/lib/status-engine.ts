@@ -38,10 +38,6 @@ function compareProbeResults(a: ProbeResultRow, b: ProbeResultRow) {
     return a.checked_at > b.checked_at ? 1 : -1;
   }
 
-  if (a.id !== b.id) {
-    return a.id > b.id ? 1 : -1;
-  }
-
   return 0;
 }
 
