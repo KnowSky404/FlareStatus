@@ -3,8 +3,7 @@ import {
   listActiveOverrides,
   listLatestProbeResults,
   listServicesWithComponents,
-  updateComponentStatuses,
-  updateServiceStatuses,
+  persistStatusUpdates,
 } from "./db";
 import { buildPublicSnapshot } from "./snapshot";
 import {
@@ -15,6 +14,7 @@ import {
 import type {
   ComponentStatusUpdateRow,
   OverrideRow,
+  ProbeResultRow,
   ServiceStatusUpdateRow,
 } from "../types";
 
@@ -31,6 +31,34 @@ function pickLatestOverride(
   }
 
   return overrideMap;
+}
+
+function compareProbeResults(a: ProbeResultRow, b: ProbeResultRow) {
+  if (a.checked_at !== b.checked_at) {
+    return a.checked_at > b.checked_at ? 1 : -1;
+  }
+
+  if (a.id !== b.id) {
+    return a.id > b.id ? 1 : -1;
+  }
+
+  return 0;
+}
+
+function pickLatestProbeResult(
+  probeResults: ProbeResultRow[],
+): Map<string, ProbeResultRow> {
+  const probeResultByComponentId = new Map<string, ProbeResultRow>();
+
+  for (const probeResult of probeResults) {
+    const current = probeResultByComponentId.get(probeResult.component_id);
+
+    if (!current || compareProbeResults(probeResult, current) > 0) {
+      probeResultByComponentId.set(probeResult.component_id, probeResult);
+    }
+  }
+
+  return probeResultByComponentId;
 }
 
 export async function recomputePublicStatus(
@@ -50,9 +78,7 @@ export async function recomputePublicStatus(
     listActiveAnnouncements(db, nowIso),
   ]);
 
-  const probeResultByComponentId = new Map(
-    latestProbeResults.map((result) => [result.component_id, result] as const),
-  );
+  const probeResultByComponentId = pickLatestProbeResult(latestProbeResults);
   const overrideByTarget = pickLatestOverride(activeOverrides);
 
   const componentStatusRows: ComponentStatusUpdateRow[] = components.map(
@@ -103,8 +129,14 @@ export async function recomputePublicStatus(
     };
   });
 
-  await updateComponentStatuses(db, componentStatusRows, nowIso);
-  await updateServiceStatuses(db, serviceStatusRows, nowIso);
+  await persistStatusUpdates(
+    db,
+    {
+      componentRows: componentStatusRows,
+      serviceRows: serviceStatusRows,
+    },
+    nowIso,
+  );
 
   const serviceStatusById = new Map(
     serviceStatusRows.map((row) => [row.id, row.status] as const),

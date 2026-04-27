@@ -14,16 +14,14 @@ vi.mock("../lib/db", () => ({
   listLatestProbeResults: vi.fn(),
   listActiveOverrides: vi.fn(),
   listActiveAnnouncements: vi.fn(),
-  updateComponentStatuses: vi.fn(),
-  updateServiceStatuses: vi.fn(),
+  persistStatusUpdates: vi.fn(),
 }));
 
 const listServicesWithComponents = vi.mocked(dbModule.listServicesWithComponents);
 const listLatestProbeResults = vi.mocked(dbModule.listLatestProbeResults);
 const listActiveOverrides = vi.mocked(dbModule.listActiveOverrides);
 const listActiveAnnouncements = vi.mocked(dbModule.listActiveAnnouncements);
-const updateComponentStatuses = vi.mocked(dbModule.updateComponentStatuses);
-const updateServiceStatuses = vi.mocked(dbModule.updateServiceStatuses);
+const persistStatusUpdates = vi.mocked(dbModule.persistStatusUpdates);
 
 function createServiceRow(overrides: Partial<ServiceRow> = {}): ServiceRow {
   return {
@@ -106,8 +104,7 @@ describe("recomputePublicStatus", () => {
   beforeEach(() => {
     vi.resetAllMocks();
 
-    updateComponentStatuses.mockResolvedValue(undefined);
-    updateServiceStatuses.mockResolvedValue(undefined);
+    persistStatusUpdates.mockResolvedValue(undefined);
     listActiveAnnouncements.mockResolvedValue([]);
   });
 
@@ -131,15 +128,18 @@ describe("recomputePublicStatus", () => {
       "2026-04-27T10:00:00.000Z",
     );
 
-    expect(updateComponentStatuses).toHaveBeenCalledWith(
+    expect(persistStatusUpdates).toHaveBeenCalledWith(
       expect.anything(),
-      [
-        {
-          id: "cmp_1",
-          observedStatus: "degraded",
-          displayStatus: "major_outage",
-        },
-      ],
+      {
+        componentRows: [
+          {
+            id: "cmp_1",
+            observedStatus: "degraded",
+            displayStatus: "major_outage",
+          },
+        ],
+        serviceRows: [{ id: "svc_1", status: "major_outage" }],
+      },
       "2026-04-27T10:00:00.000Z",
     );
 
@@ -168,9 +168,18 @@ describe("recomputePublicStatus", () => {
       "2026-04-27T10:00:00.000Z",
     );
 
-    expect(updateServiceStatuses).toHaveBeenCalledWith(
+    expect(persistStatusUpdates).toHaveBeenCalledWith(
       expect.anything(),
-      [{ id: "svc_1", status: "partial_outage" }],
+      {
+        componentRows: [
+          {
+            id: "cmp_1",
+            observedStatus: "partial_outage",
+            displayStatus: "partial_outage",
+          },
+        ],
+        serviceRows: [{ id: "svc_1", status: "partial_outage" }],
+      },
       "2026-04-27T10:00:00.000Z",
     );
 
@@ -230,5 +239,53 @@ describe("recomputePublicStatus", () => {
     const snapshot = JSON.parse(kvPut.mock.calls[0][1] as string);
 
     expect(snapshot.summary.status).toBe("major_outage");
+  });
+
+  it("picks a deterministic winner when duplicate latest probe rows exist for one component", async () => {
+    listServicesWithComponents.mockResolvedValue({
+      services: [createServiceRow()],
+      components: [createComponentRow()],
+    });
+    listLatestProbeResults.mockResolvedValue([
+      createProbeResultRow({
+        id: "probe_b",
+        status: "operational",
+        checked_at: "2026-04-27T10:00:00.000Z",
+      }),
+      createProbeResultRow({
+        id: "probe_a",
+        status: "major_outage",
+        checked_at: "2026-04-27T10:00:00.000Z",
+      }),
+    ]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    const kvPut = vi.fn();
+
+    await recomputePublicStatus(
+      {} as D1Database,
+      { put: kvPut } as unknown as KVNamespace,
+      "2026-04-27T10:00:00.000Z",
+    );
+
+    expect(persistStatusUpdates).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        componentRows: [
+          {
+            id: "cmp_1",
+            observedStatus: "operational",
+            displayStatus: "operational",
+          },
+        ],
+      }),
+      "2026-04-27T10:00:00.000Z",
+    );
+
+    const snapshot = JSON.parse(kvPut.mock.calls[0][1] as string);
+
+    expect(snapshot.services[0]?.components[0]?.displayStatus).toBe(
+      "operational",
+    );
   });
 });

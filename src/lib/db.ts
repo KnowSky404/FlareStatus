@@ -59,15 +59,36 @@ export async function listServicesWithComponents(db: D1Database) {
 export async function listLatestProbeResults(db: D1Database) {
   const results = await db
     .prepare(
-      `SELECT pr.*
-       FROM probe_results pr
-       INNER JOIN (
-         SELECT component_id, MAX(checked_at) AS checked_at
+      `WITH ranked_probe_results AS (
+         SELECT
+           id,
+           component_id,
+           probe_source,
+           status,
+           latency_ms,
+           http_code,
+           summary,
+           raw_payload,
+           checked_at,
+           ROW_NUMBER() OVER (
+             PARTITION BY component_id
+             ORDER BY checked_at DESC, id DESC
+           ) AS probe_rank
          FROM probe_results
-         GROUP BY component_id
-       ) latest
-         ON latest.component_id = pr.component_id
-        AND latest.checked_at = pr.checked_at`,
+       )
+       SELECT
+         id,
+         component_id,
+         probe_source,
+         status,
+         latency_ms,
+         http_code,
+         summary,
+         raw_payload,
+         checked_at
+       FROM ranked_probe_results
+       WHERE probe_rank = 1
+       ORDER BY component_id`,
     )
     .all<ProbeResultRow>();
 
@@ -104,40 +125,40 @@ export async function listActiveAnnouncements(db: D1Database, nowIso: string) {
   return results.results;
 }
 
-export async function updateComponentStatuses(
+export async function persistStatusUpdates(
   db: D1Database,
-  rows: ComponentStatusUpdateRow[],
+  input: {
+    componentRows: ComponentStatusUpdateRow[];
+    serviceRows: ServiceStatusUpdateRow[];
+  },
   nowIso: string,
 ) {
-  await Promise.all(
-    rows.map((row) =>
+  const statements = [
+    ...input.componentRows.map((row) =>
       db
         .prepare(
           `UPDATE components
            SET observed_status = ?, display_status = ?, updated_at = ?
            WHERE id = ?`,
         )
-        .bind(row.observedStatus, row.displayStatus, nowIso, row.id)
-        .run(),
+        .bind(row.observedStatus, row.displayStatus, nowIso, row.id),
     ),
-  );
-}
-
-export async function updateServiceStatuses(
-  db: D1Database,
-  rows: ServiceStatusUpdateRow[],
-  nowIso: string,
-) {
-  await Promise.all(
-    rows.map((row) =>
+    ...input.serviceRows.map((row) =>
       db
         .prepare(
           `UPDATE services
            SET status = ?, updated_at = ?
            WHERE id = ?`,
         )
-        .bind(row.status, nowIso, row.id)
-        .run(),
+        .bind(row.status, nowIso, row.id),
     ),
+  ];
+
+  if (statements.length === 0) {
+    return;
+  }
+
+  await db.batch(
+    statements,
   );
 }
