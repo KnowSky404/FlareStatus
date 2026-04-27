@@ -1,11 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../lib/env";
+import { recomputePublicStatus } from "../lib/status-engine";
 import worker from "../worker";
+
+vi.mock("../lib/status-engine", () => ({
+  recomputePublicStatus: vi.fn(),
+}));
 
 const validPayload = {
   componentSlug: "sub2api-health",
   status: "operational",
   latencyMs: 120,
+  summary: "HTTP 200 in 120ms",
   checkedAt: "2026-04-27T10:00:00.000Z",
 };
 
@@ -16,6 +22,7 @@ interface DbCallState {
 }
 
 type D1RunResult = Awaited<ReturnType<D1PreparedStatement["run"]>>;
+const recomputePublicStatusMock = vi.mocked(recomputePublicStatus);
 
 function createEnv(options?: {
   expectedBindings?: unknown[];
@@ -57,7 +64,7 @@ function createEnv(options?: {
   const bind = (...bindings: unknown[]) => {
     dbCalls.bindCalled = true;
 
-    expect(bindings).toHaveLength(6);
+    expect(bindings).toHaveLength(7);
     expect(typeof bindings[0]).toBe("string");
 
     if (expectedBindings) {
@@ -71,8 +78,8 @@ function createEnv(options?: {
     dbCalls.prepareCalled = true;
 
     expect(sql).toBe(
-      `INSERT INTO probe_results (id, component_id, probe_source, status, latency_ms, checked_at)
-     SELECT ?, id, ?, ?, ?, ? FROM components WHERE slug = ?`,
+      `INSERT INTO probe_results (id, component_id, probe_source, status, latency_ms, summary, checked_at)
+     SELECT ?, id, ?, ?, ?, ?, ? FROM components WHERE slug = ?`,
     );
 
     return { bind } as Pick<D1PreparedStatement, "bind">;
@@ -105,12 +112,18 @@ function createRequest(
 }
 
 describe("probe ingest", () => {
-  it("accepts a signed report payload", async () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    recomputePublicStatusMock.mockResolvedValue(undefined as never);
+  });
+
+  it("accepts a signed report payload, stores its summary, and rebuilds public status", async () => {
     const { env, dbCalls } = createEnv({
       expectedBindings: [
         "docker-probe",
         validPayload.status,
         validPayload.latencyMs,
+        validPayload.summary,
         validPayload.checkedAt,
         validPayload.componentSlug,
       ],
@@ -129,6 +142,11 @@ describe("probe ingest", () => {
       bindCalled: true,
       runCalled: true,
     });
+    expect(recomputePublicStatusMock).toHaveBeenCalledWith(
+      env.DB,
+      env.STATUS_SNAPSHOTS,
+      validPayload.checkedAt,
+    );
   });
 
   it("accepts a signed report payload with lowercase bearer auth", async () => {
@@ -137,6 +155,7 @@ describe("probe ingest", () => {
         "docker-probe",
         validPayload.status,
         validPayload.latencyMs,
+        validPayload.summary,
         validPayload.checkedAt,
         validPayload.componentSlug,
       ],
@@ -155,6 +174,11 @@ describe("probe ingest", () => {
       bindCalled: true,
       runCalled: true,
     });
+    expect(recomputePublicStatusMock).toHaveBeenCalledWith(
+      env.DB,
+      env.STATUS_SNAPSHOTS,
+      validPayload.checkedAt,
+    );
   });
 
   it("rejects an unauthorized request without touching the db", async () => {
@@ -300,5 +324,6 @@ describe("probe ingest", () => {
       bindCalled: true,
       runCalled: true,
     });
+    expect(recomputePublicStatusMock).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,5 @@
 import type { Env } from "../lib/env";
+import { recomputePublicStatus } from "../lib/status-engine";
 
 const PROBE_STATUSES = new Set([
   "operational",
@@ -11,6 +12,7 @@ interface ProbeReportPayload {
   componentSlug: string;
   status: string;
   latencyMs: number;
+  summary?: string;
   checkedAt: string;
 }
 
@@ -46,6 +48,7 @@ function isValidProbeReportPayload(
     typeof candidate.latencyMs === "number" &&
     Number.isFinite(candidate.latencyMs) &&
     candidate.latencyMs >= 0 &&
+    (candidate.summary === undefined || typeof candidate.summary === "string") &&
     typeof candidate.checkedAt === "string" &&
     isValidCheckedAt(candidate.checkedAt)
   );
@@ -84,14 +87,15 @@ export async function handleProbeReport(
   }
 
   const result = await env.DB.prepare(
-    `INSERT INTO probe_results (id, component_id, probe_source, status, latency_ms, checked_at)
-     SELECT ?, id, ?, ?, ?, ? FROM components WHERE slug = ?`,
+    `INSERT INTO probe_results (id, component_id, probe_source, status, latency_ms, summary, checked_at)
+     SELECT ?, id, ?, ?, ?, ?, ? FROM components WHERE slug = ?`,
   )
     .bind(
       crypto.randomUUID(),
       "docker-probe",
       payload.status,
       payload.latencyMs,
+      payload.summary ?? "",
       payload.checkedAt,
       payload.componentSlug,
     )
@@ -100,6 +104,8 @@ export async function handleProbeReport(
   if (result.meta.changes === 0) {
     return new Response("component not found", { status: 404 });
   }
+
+  await recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, payload.checkedAt);
 
   return Response.json({ accepted: true }, { status: 202 });
 }

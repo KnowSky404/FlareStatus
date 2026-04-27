@@ -7,7 +7,13 @@ interface PublicStatusPayload {
   generatedAt: string;
   summary: { status: string };
   announcements: unknown[];
-  services: unknown[];
+  services: Array<{
+    slug: string;
+    components: Array<{
+      slug: string;
+      displayStatus: string;
+    }>;
+  }>;
 }
 
 function createEnv(snapshot?: unknown): Env {
@@ -95,7 +101,15 @@ describe("public status route", () => {
           slug: "sub2api",
           name: "Sub2API",
           status: "degraded",
-          components: [],
+          components: [
+            {
+              id: "cmp_1",
+              serviceId: "svc_1",
+              slug: "sub2api-health",
+              name: "Sub2API Health",
+              displayStatus: "degraded",
+            },
+          ],
         },
       ],
     });
@@ -107,19 +121,21 @@ describe("public status route", () => {
     );
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual({
+    const payload = (await response.json()) as PublicStatusPayload;
+
+    expect(payload).toMatchObject({
       generatedAt: "2026-04-27T10:00:00.000Z",
       summary: { status: "degraded" },
       announcements: [],
-      services: [
-        {
-          id: "svc_1",
-          slug: "sub2api",
-          name: "Sub2API",
-          status: "degraded",
-          components: [],
-        },
-      ],
+    });
+    expect(payload.services).toHaveLength(1);
+    expect(payload.services[0]).toMatchObject({
+      slug: "sub2api",
+    });
+    expect(payload.services[0]?.components).toHaveLength(1);
+    expect(payload.services[0]?.components[0]).toMatchObject({
+      slug: "sub2api-health",
+      displayStatus: "degraded",
     });
   });
 
