@@ -125,6 +125,66 @@ export async function listActiveAnnouncements(db: D1Database, nowIso: string) {
   return results.results;
 }
 
+function buildComponentStatusStatements(
+  db: D1Database,
+  rows: ComponentStatusUpdateRow[],
+  nowIso: string,
+) {
+  return rows.map((row) =>
+    db
+      .prepare(
+        `UPDATE components
+         SET observed_status = ?, display_status = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .bind(row.observedStatus, row.displayStatus, nowIso, row.id),
+  );
+}
+
+function buildServiceStatusStatements(
+  db: D1Database,
+  rows: ServiceStatusUpdateRow[],
+  nowIso: string,
+) {
+  return rows.map((row) =>
+    db
+      .prepare(
+        `UPDATE services
+         SET status = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .bind(row.status, nowIso, row.id),
+  );
+}
+
+export async function updateComponentStatuses(
+  db: D1Database,
+  rows: ComponentStatusUpdateRow[],
+  nowIso: string,
+) {
+  const statements = buildComponentStatusStatements(db, rows, nowIso);
+
+  if (statements.length === 0) {
+    return;
+  }
+
+  await db.batch(statements);
+}
+
+export async function updateServiceStatuses(
+  db: D1Database,
+  rows: ServiceStatusUpdateRow[],
+  nowIso: string,
+) {
+  const statements = buildServiceStatusStatements(db, rows, nowIso);
+
+  if (statements.length === 0) {
+    return;
+  }
+
+  await db.batch(statements);
+}
+
 export async function persistStatusUpdates(
   db: D1Database,
   input: {
@@ -134,31 +194,13 @@ export async function persistStatusUpdates(
   nowIso: string,
 ) {
   const statements = [
-    ...input.componentRows.map((row) =>
-      db
-        .prepare(
-          `UPDATE components
-           SET observed_status = ?, display_status = ?, updated_at = ?
-           WHERE id = ?`,
-        )
-        .bind(row.observedStatus, row.displayStatus, nowIso, row.id),
-    ),
-    ...input.serviceRows.map((row) =>
-      db
-        .prepare(
-          `UPDATE services
-           SET status = ?, updated_at = ?
-           WHERE id = ?`,
-        )
-        .bind(row.status, nowIso, row.id),
-    ),
+    ...buildComponentStatusStatements(db, input.componentRows, nowIso),
+    ...buildServiceStatusStatements(db, input.serviceRows, nowIso),
   ];
 
   if (statements.length === 0) {
     return;
   }
 
-  await db.batch(
-    statements,
-  );
+  await db.batch(statements);
 }
