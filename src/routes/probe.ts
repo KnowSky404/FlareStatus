@@ -72,6 +72,7 @@ function hasValidProbeAuthorization(auth: string | null, token: string): boolean
 export async function handleProbeReport(
   request: Request,
   env: Env,
+  ctx: ExecutionContext,
 ): Promise<Response> {
   const auth = request.headers.get("authorization");
 
@@ -111,12 +112,11 @@ export async function handleProbeReport(
   }
 
   const nowIso = new Date().toISOString();
-
-  try {
-    await recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso);
-  } catch (error) {
-    console.error("probe ingest recompute failed", error);
-  }
+  ctx.waitUntil(
+    recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso).catch((error) => {
+      console.error("probe ingest recompute failed", error);
+    }),
+  );
 
   return Response.json({ accepted: true }, { status: 202 });
 }

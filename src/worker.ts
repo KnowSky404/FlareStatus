@@ -6,9 +6,9 @@ import { handleProbeReport } from "./routes/probe";
 import { handlePublicStatus } from "./routes/public";
 
 const worker = {
-  fetch(request: Request, env: Env, _ctx: ExecutionContext) {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
     if (matchesRoute(request, "POST", "/api/probe/report")) {
-      return handleProbeReport(request, env);
+      return handleProbeReport(request, env, ctx);
     }
 
     if (matchesRoute(request, "POST", "/api/admin/overrides")) {

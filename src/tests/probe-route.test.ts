@@ -24,6 +24,21 @@ interface DbCallState {
 type D1RunResult = Awaited<ReturnType<D1PreparedStatement["run"]>>;
 const recomputePublicStatusMock = vi.mocked(recomputePublicStatus);
 
+function createCtx() {
+  const waitUntilPromises: Promise<unknown>[] = [];
+
+  return {
+    ctx: {
+      waitUntil(promise: Promise<unknown>) {
+        waitUntilPromises.push(promise);
+      },
+      passThroughOnException() {},
+      props: {},
+    } as ExecutionContext,
+    waitUntilPromises,
+  };
+}
+
 function createEnv(options?: {
   expectedBindings?: unknown[];
   changes?: number;
@@ -135,11 +150,12 @@ describe("probe ingest", () => {
         validPayload.componentSlug,
       ],
     });
+    const { ctx } = createCtx();
 
     const response = await worker.fetch(
       createRequest(JSON.stringify(validPayload)),
       env,
-      {} as ExecutionContext,
+      ctx,
     );
 
     expect(response.status).toBe(202);
@@ -170,11 +186,12 @@ describe("probe ingest", () => {
         validPayload.componentSlug,
       ],
     });
+    const { ctx } = createCtx();
 
     const response = await worker.fetch(
       createRequest(JSON.stringify(validPayload), "test-probe-token", "bearer"),
       env,
-      {} as ExecutionContext,
+      ctx,
     );
 
     expect(response.status).toBe(202);
@@ -202,12 +219,13 @@ describe("probe ingest", () => {
         validPayload.componentSlug,
       ],
     });
+    const { ctx } = createCtx();
 
     const { summary: _summary, ...payloadWithoutSummary } = validPayload;
     const response = await worker.fetch(
       createRequest(JSON.stringify(payloadWithoutSummary)),
       env,
-      {} as ExecutionContext,
+      ctx,
     );
 
     expect(response.status).toBe(202);
@@ -235,15 +253,17 @@ describe("probe ingest", () => {
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
     recomputePublicStatusMock.mockRejectedValue(error);
+    const { ctx, waitUntilPromises } = createCtx();
 
     const response = await worker.fetch(
       createRequest(JSON.stringify(validPayload)),
       env,
-      {} as ExecutionContext,
+      ctx,
     );
 
     expect(response.status).toBe(202);
     await expect(response.json()).resolves.toEqual({ accepted: true });
+    await Promise.all(waitUntilPromises);
     expect(dbCalls).toEqual({
       prepareCalled: true,
       bindCalled: true,
@@ -256,13 +276,43 @@ describe("probe ingest", () => {
     );
   });
 
+  it("returns 202 without waiting for recompute to finish", async () => {
+    const { env, dbCalls } = createEnv({
+      expectedBindings: [
+        "docker-probe",
+        validPayload.status,
+        validPayload.latencyMs,
+        validPayload.summary,
+        validPayload.checkedAt,
+        validPayload.componentSlug,
+      ],
+    });
+    const { ctx, waitUntilPromises } = createCtx();
+    recomputePublicStatusMock.mockReturnValue(new Promise(() => {}) as never);
+
+    const result = await Promise.race([
+      worker.fetch(createRequest(JSON.stringify(validPayload)), env, ctx),
+      new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 25)),
+    ]);
+
+    expect(result).not.toBe("timeout");
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response).status).toBe(202);
+    expect(dbCalls).toEqual({
+      prepareCalled: true,
+      bindCalled: true,
+      runCalled: true,
+    });
+    expect(waitUntilPromises).toHaveLength(1);
+  });
+
   it("rejects an unauthorized request without touching the db", async () => {
     const { env, dbCalls } = createEnv();
 
     const response = await worker.fetch(
       createRequest(JSON.stringify(validPayload), "wrong-token"),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(401);
@@ -280,7 +330,7 @@ describe("probe ingest", () => {
     const response = await worker.fetch(
       createRequest(JSON.stringify({ ...validPayload, latencyMs: "120" })),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(400);
@@ -298,7 +348,7 @@ describe("probe ingest", () => {
     const response = await worker.fetch(
       createRequest(JSON.stringify({ ...validPayload, status: "down" })),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(400);
@@ -316,7 +366,7 @@ describe("probe ingest", () => {
     const response = await worker.fetch(
       createRequest(JSON.stringify({ ...validPayload, latencyMs: -1 })),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(400);
@@ -334,7 +384,7 @@ describe("probe ingest", () => {
     const response = await worker.fetch(
       createRequest(JSON.stringify({ ...validPayload, checkedAt: "not-a-date" })),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(400);
@@ -357,7 +407,7 @@ describe("probe ingest", () => {
         }),
       ),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(400);
@@ -383,7 +433,7 @@ describe("probe ingest", () => {
         }),
       ),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(400);
@@ -399,7 +449,7 @@ describe("probe ingest", () => {
   it("rejects malformed json without touching the db", async () => {
     const { env, dbCalls } = createEnv();
 
-    const response = await worker.fetch(createRequest("{"), env, {} as ExecutionContext);
+    const response = await worker.fetch(createRequest("{"), env, createCtx().ctx);
 
     expect(response.status).toBe(400);
     await expect(response.text()).resolves.toBe("invalid payload");
@@ -416,7 +466,7 @@ describe("probe ingest", () => {
     const response = await worker.fetch(
       createRequest(JSON.stringify(validPayload)),
       env,
-      {} as ExecutionContext,
+      createCtx().ctx,
     );
 
     expect(response.status).toBe(404);
