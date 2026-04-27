@@ -157,6 +157,9 @@ describe("probe ingest", () => {
   });
 
   it("accepts a signed report payload with lowercase bearer auth", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T10:05:00.000Z"));
+
     const { env, dbCalls } = createEnv({
       expectedBindings: [
         "docker-probe",
@@ -184,7 +187,7 @@ describe("probe ingest", () => {
     expect(recomputePublicStatusMock).toHaveBeenCalledWith(
       env.DB,
       env.STATUS_SNAPSHOTS,
-      expect.any(String),
+      "2026-04-27T10:05:00.000Z",
     );
   });
 
@@ -364,6 +367,33 @@ describe("probe ingest", () => {
       bindCalled: false,
       runCalled: false,
     });
+  });
+
+  it("rejects a checkedAt value that is too far in the future", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T10:00:00.000Z"));
+
+    const { env, dbCalls } = createEnv();
+
+    const response = await worker.fetch(
+      createRequest(
+        JSON.stringify({
+          ...validPayload,
+          checkedAt: "2026-04-27T10:10:01.000Z",
+        }),
+      ),
+      env,
+      {} as ExecutionContext,
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+    expect(dbCalls).toEqual({
+      prepareCalled: false,
+      bindCalled: false,
+      runCalled: false,
+    });
+    expect(recomputePublicStatusMock).not.toHaveBeenCalled();
   });
 
   it("rejects malformed json without touching the db", async () => {

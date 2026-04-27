@@ -17,6 +17,7 @@ interface ProbeReportPayload {
 }
 
 const ISO_UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 function isValidCheckedAt(value: string): boolean {
   if (!ISO_UTC_TIMESTAMP.test(value)) {
@@ -29,7 +30,11 @@ function isValidCheckedAt(value: string): boolean {
     return false;
   }
 
-  return new Date(parsed).toISOString() === value;
+  if (new Date(parsed).toISOString() !== value) {
+    return false;
+  }
+
+  return parsed <= Date.now() + MAX_FUTURE_CLOCK_SKEW_MS;
 }
 
 function isValidProbeReportPayload(
