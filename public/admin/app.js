@@ -167,7 +167,7 @@ function renderServiceList() {
   elements.serviceList.innerHTML = filteredServices
     .map(
       (service) => `
-        <article class="service-item ${service.slug === state.selectedServiceSlug ? "active" : ""}">
+        <article class="service-item ${service.slug === state.selectedServiceSlug ? "active" : ""}" data-service-slug="${service.slug}">
           <button type="button" data-service-select="${service.slug}">
             <strong>${service.name}</strong>
             <div class="service-meta">
@@ -212,7 +212,7 @@ function renderServiceForm() {
 
 function createComponentEditor(component) {
   return `
-    <article class="component-item">
+    <article class="component-item" data-component-row="${component.slug}">
       <div class="component-meta">
         <strong>${component.name}</strong>
         <span>${component.enabled ? "Enabled" : "Disabled"}</span>

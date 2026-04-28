@@ -105,6 +105,7 @@ function createCtx(): ExecutionContext {
 }
 
 const publicAppScript = readFileSync("public/app.js", "utf8");
+const adminAppScript = readFileSync("public/admin/app.js", "utf8");
 const AsyncFunction = async function () {}.constructor as new (
   ...args: string[]
 ) => (...args: unknown[]) => Promise<unknown>;
@@ -155,6 +156,254 @@ async function runPublicApp({
     announcementListEl,
     serviceListEl,
   };
+}
+
+function createMockElement(overrides: Record<string, unknown> = {}) {
+  return {
+    value: "",
+    checked: false,
+    textContent: "",
+    innerHTML: "",
+    className: "",
+    listeners: new Map<string, Array<() => void>>(),
+    addEventListener(type: string, listener: () => void) {
+      const handlers = this.listeners.get(type) ?? [];
+      handlers.push(listener);
+      this.listeners.set(type, handlers);
+    },
+    dispatch(type: string) {
+      for (const listener of this.listeners.get(type) ?? []) {
+        listener();
+      }
+    },
+    click() {
+      this.dispatch("click");
+    },
+    getAttribute(_name?: string) {
+      return null;
+    },
+    ...overrides,
+  };
+}
+
+async function runAdminApp({
+  fetchImpl,
+  token = "test-admin-token",
+}: {
+  fetchImpl: typeof fetch;
+  token?: string;
+}) {
+  const serviceName = createMockElement();
+  const serviceSlug = createMockElement();
+  const serviceDescription = createMockElement();
+  const serviceSortOrder = createMockElement();
+  const serviceEnabled = createMockElement();
+  const serviceForm = createMockElement({
+    querySelector(selector: string) {
+      const map = new Map<string, ReturnType<typeof createMockElement>>([
+        ["#service-name", serviceName],
+        ["#service-slug", serviceSlug],
+        ["#service-description", serviceDescription],
+        ["#service-sort-order", serviceSortOrder],
+        ["#service-enabled", serviceEnabled],
+      ]);
+      return map.get(selector) ?? null;
+    },
+  });
+
+  const dynamicState = {
+    serviceSelectButtons: [] as Array<ReturnType<typeof createMockElement>>,
+    componentSaveButtons: [] as Array<ReturnType<typeof createMockElement>>,
+    componentFieldsBySlug: new Map<string, Array<ReturnType<typeof createMockElement>>>(),
+  };
+
+  const serviceList = createMockElement({
+    querySelectorAll(selector: string) {
+      if (selector !== "[data-service-select]") {
+        return [];
+      }
+
+      return dynamicState.serviceSelectButtons;
+    },
+  });
+
+  const componentList = createMockElement({
+    querySelectorAll(selector: string) {
+      if (selector !== "[data-save-component]") {
+        return [];
+      }
+
+      return dynamicState.componentSaveButtons;
+    },
+  });
+
+  const adminStatus = createMockElement();
+  const previewSummary = createMockElement();
+  const previewService = createMockElement();
+  const previewAnnouncements = createMockElement();
+  const tokenInput = createMockElement({ value: token });
+  const connectButton = createMockElement();
+  const serviceSearch = createMockElement();
+  const newServiceButton = createMockElement();
+  const saveServiceButton = createMockElement();
+  const newComponentButton = createMockElement();
+  const overrideTargetType = createMockElement({ value: "service" });
+  const overrideTargetSlug = createMockElement();
+  const overrideStatus = createMockElement({ value: "degraded" });
+  const overrideMessage = createMockElement();
+  const submitOverrideButton = createMockElement();
+  const announcementTitle = createMockElement();
+  const announcementBody = createMockElement();
+  const announcementStatus = createMockElement({ value: "operational" });
+  const submitAnnouncementButton = createMockElement();
+
+  Object.defineProperty(serviceList, "innerHTML", {
+    get() {
+      return this._innerHTML ?? "";
+    },
+    set(value: string) {
+      this._innerHTML = value;
+      dynamicState.serviceSelectButtons = Array.from(
+        value.matchAll(/data-service-select="([^"]+)"/g),
+      ).map((match) => createMockElement({ getAttribute: () => match[1] }));
+    },
+  });
+
+  Object.defineProperty(componentList, "innerHTML", {
+    get() {
+      return this._innerHTML ?? "";
+    },
+    set(value: string) {
+      this._innerHTML = value;
+      dynamicState.componentSaveButtons = Array.from(
+        value.matchAll(/data-save-component="([^"]+)"/g),
+      ).map((match) => createMockElement({ getAttribute: () => match[1] }));
+
+      dynamicState.componentFieldsBySlug = new Map();
+      for (const slugMatch of value.matchAll(/data-component-row="([^"]+)"/g)) {
+        const slug = slugMatch[1];
+        const fields = [
+          ["name", "New Component"],
+          ["slug", slug],
+          ["probeType", "http"],
+          ["description", ""],
+          ["sortOrder", "0"],
+          ["enabled", "true"],
+          ["isCritical", "false"],
+        ].map(([field, initialValue]) =>
+          createMockElement({
+            value: initialValue,
+            getAttribute(attribute: string) {
+              if (attribute === "data-component-slug") {
+                return slug;
+              }
+
+              if (attribute === "data-component-field") {
+                return field;
+              }
+
+              return null;
+            },
+          }),
+        );
+
+        dynamicState.componentFieldsBySlug.set(slug, fields);
+      }
+    },
+  });
+
+  const elementsBySelector = new Map<string, ReturnType<typeof createMockElement> | null>([
+    ["#admin-token", tokenInput],
+    ["#connect-token", connectButton],
+    ["#admin-status", adminStatus],
+    ["#preview-summary", previewSummary],
+    ["#preview-service", previewService],
+    ["#preview-announcements", previewAnnouncements],
+    ["#service-search", serviceSearch],
+    ["#service-list", serviceList],
+    ["#new-service", newServiceButton],
+    ["#service-form", serviceForm],
+    ["#save-service", saveServiceButton],
+    ["#new-component", newComponentButton],
+    ["#component-list", componentList],
+    ["#override-target-type", overrideTargetType],
+    ["#override-target-slug", overrideTargetSlug],
+    ["#override-status", overrideStatus],
+    ["#override-message", overrideMessage],
+    ["#submit-override", submitOverrideButton],
+    ["#announcement-title", announcementTitle],
+    ["#announcement-body", announcementBody],
+    ["#announcement-status", announcementStatus],
+    ["#submit-announcement", submitAnnouncementButton],
+  ]);
+
+  const document = {
+    querySelector(selector: string) {
+      if (!elementsBySelector.has(selector)) {
+        throw new Error(`Unexpected selector: ${selector}`);
+      }
+
+      return elementsBySelector.get(selector) ?? null;
+    },
+    querySelectorAll(selector: string) {
+      const componentSlugMatch = selector.match(/^\[data-component-slug="([^"]+)"\]$/);
+
+      if (!componentSlugMatch) {
+        return [];
+      }
+
+      return dynamicState.componentFieldsBySlug.get(componentSlugMatch[1]) ?? [];
+    },
+  };
+
+  const window = {
+    localStorage: {
+      getItem(key: string) {
+        if (key === "flarestatus.adminToken") {
+          return token;
+        }
+
+        return null;
+      },
+      setItem() {},
+    },
+  };
+
+  const runScript = new AsyncFunction("fetch", "document", "window", adminAppScript);
+  await runScript(fetchImpl, document, window);
+
+  return {
+    adminStatus,
+    previewSummary,
+    previewService,
+    previewAnnouncements,
+    serviceList,
+    componentList,
+    serviceName,
+    serviceSlug,
+    serviceDescription,
+    serviceSortOrder,
+    serviceEnabled,
+    saveServiceButton,
+    componentSaveButtons: dynamicState.componentSaveButtons,
+    getComponentFields(componentSlug: string) {
+      return dynamicState.componentFieldsBySlug.get(componentSlug) ?? [];
+    },
+    submitOverrideButton,
+    submitAnnouncementButton,
+    overrideTargetSlug,
+    overrideMessage,
+    announcementTitle,
+    announcementBody,
+  };
+}
+
+function createJsonResponse(data: unknown, ok = true) {
+  return {
+    ok,
+    json: async () => data,
+    text: async () => (typeof data === "string" ? data : JSON.stringify(data)),
+  } as Response;
 }
 
 const listServicesWithComponents = vi.mocked(dbModule.listServicesWithComponents);
@@ -681,6 +930,238 @@ describe("public status shell", () => {
     });
 
     expect(result.summaryEl).toBeNull();
+  });
+});
+
+describe("admin console shell", () => {
+  const catalogPayload = {
+    services: [
+      {
+        id: "svc_1",
+        slug: "sub2api",
+        name: "Sub2API",
+        description: "Primary API",
+        sortOrder: 0,
+        enabled: true,
+        status: "operational",
+        components: [
+          {
+            id: "cmp_1",
+            serviceId: "svc_1",
+            slug: "sub2api-health",
+            name: "Health",
+            description: "Health endpoint",
+            probeType: "http",
+            isCritical: true,
+            sortOrder: 0,
+            enabled: true,
+            observedStatus: "operational",
+            displayStatus: "operational",
+          },
+        ],
+      },
+    ],
+  };
+
+  const publicPayload = {
+    summary: { status: "operational" },
+    announcements: [],
+    services: [
+      {
+        id: "svc_1",
+        slug: "sub2api",
+        name: "Sub2API",
+        status: "operational",
+        components: [],
+      },
+    ],
+  };
+
+  it("loads the catalog and renders the selected service editor", async () => {
+    const result = await runAdminApp({
+      fetchImpl: async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(init?.headers).toBeDefined();
+        const url = String(input);
+
+        if (url === "/api/public/status") {
+          return createJsonResponse(publicPayload);
+        }
+
+        expect(url).toBe("/api/admin/catalog");
+        return createJsonResponse(catalogPayload);
+      },
+    });
+
+    expect(result.adminStatus.textContent).toBe("Editable catalog loaded.");
+    expect(result.serviceList.innerHTML).toContain('data-service-slug="sub2api"');
+    expect(result.serviceName.value).toBe("Sub2API");
+    expect(result.serviceSlug.value).toBe("sub2api");
+    expect(result.componentList.innerHTML).toContain('data-component-row="sub2api-health"');
+  });
+
+  it("saves a service and refreshes the preview", async () => {
+    const calls: Array<{ url: string; method: string; body?: string }> = [];
+    const result = await runAdminApp({
+      fetchImpl: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        calls.push({
+          url,
+          method,
+          body: typeof init?.body === "string" ? init.body : undefined,
+        });
+
+        if (url === "/api/public/status") {
+          return createJsonResponse(publicPayload);
+        }
+
+        if (url === "/api/admin/catalog") {
+          return createJsonResponse(catalogPayload);
+        }
+
+        if (url === "/api/admin/services/sub2api" && method === "PATCH") {
+          return createJsonResponse({ updated: true });
+        }
+
+        throw new Error(`Unexpected request: ${method} ${url}`);
+      },
+    });
+
+    result.serviceName.value = "Sub2API Core";
+    result.serviceSlug.value = "sub2api-core";
+    result.serviceDescription.value = "Renamed";
+    result.serviceSortOrder.value = "3";
+    result.serviceEnabled.checked = false;
+
+    result.saveServiceButton.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const patchCall = calls.find(
+      (call) => call.url === "/api/admin/services/sub2api" && call.method === "PATCH",
+    );
+
+    expect(patchCall?.body).toContain('"slug":"sub2api-core"');
+    expect(patchCall?.body).toContain('"name":"Sub2API Core"');
+    expect(result.adminStatus.textContent).toBe("Saved service Sub2API Core");
+  });
+
+  it("saves a component via the inline editor", async () => {
+    const calls: Array<{ url: string; method: string; body?: string }> = [];
+    const result = await runAdminApp({
+      fetchImpl: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        calls.push({
+          url,
+          method,
+          body: typeof init?.body === "string" ? init.body : undefined,
+        });
+
+        if (url === "/api/public/status") {
+          return createJsonResponse(publicPayload);
+        }
+
+        if (url === "/api/admin/catalog") {
+          return createJsonResponse(catalogPayload);
+        }
+
+        if (url === "/api/admin/components/sub2api-health" && method === "PATCH") {
+          return createJsonResponse({ updated: true });
+        }
+
+        throw new Error(`Unexpected request: ${method} ${url}`);
+      },
+    });
+
+    const componentFields = result.getComponentFields("sub2api-health");
+    const nameField = componentFields.find(
+      (field) => field.getAttribute("data-component-field") === "name",
+    );
+    const slugField = componentFields.find(
+      (field) => field.getAttribute("data-component-field") === "slug",
+    );
+
+    expect(nameField).toBeDefined();
+    expect(slugField).toBeDefined();
+
+    nameField!.value = "Healthz";
+    slugField!.value = "sub2api-healthz";
+
+    result.componentSaveButtons[0]?.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const patchCall = calls.find(
+      (call) =>
+        call.url === "/api/admin/components/sub2api-health" &&
+        call.method === "PATCH",
+    );
+
+    expect(patchCall?.body).toContain('"name":"Healthz"');
+    expect(patchCall?.body).toContain('"slug":"sub2api-healthz"');
+    expect(result.adminStatus.textContent).toBe("Saved component Healthz");
+  });
+
+  it("submits overrides and announcements from the side rail", async () => {
+    const calls: Array<{ url: string; method: string; body?: string }> = [];
+    const result = await runAdminApp({
+      fetchImpl: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        calls.push({
+          url,
+          method,
+          body: typeof init?.body === "string" ? init.body : undefined,
+        });
+
+        if (url === "/api/public/status") {
+          return createJsonResponse(publicPayload);
+        }
+
+        if (url === "/api/admin/catalog") {
+          return createJsonResponse(catalogPayload);
+        }
+
+        if (url === "/api/admin/overrides" && method === "POST") {
+          return createJsonResponse({ created: true });
+        }
+
+        if (url === "/api/admin/announcements" && method === "POST") {
+          return createJsonResponse({ created: true });
+        }
+
+        throw new Error(`Unexpected request: ${method} ${url}`);
+      },
+    });
+
+    result.overrideTargetSlug.value = "sub2api";
+    result.overrideMessage.value = "Manual degradation";
+    result.submitOverrideButton.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const overrideCall = calls.find(
+      (call) => call.url === "/api/admin/overrides" && call.method === "POST",
+    );
+    expect(overrideCall?.body).toContain('"targetSlug":"sub2api"');
+    expect(overrideCall?.body).toContain('"message":"Manual degradation"');
+
+    result.announcementTitle.value = "Scheduled maintenance";
+    result.announcementBody.value = "Expect partial traffic disruption.";
+    result.submitAnnouncementButton.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const announcementCall = calls.find(
+      (call) =>
+        call.url === "/api/admin/announcements" && call.method === "POST",
+    );
+    expect(announcementCall?.body).toContain('"title":"Scheduled maintenance"');
+    expect(announcementCall?.body).toContain(
+      '"body":"Expect partial traffic disruption."',
+    );
+    expect(result.adminStatus.textContent).toBe("Announcement published");
   });
 });
 
