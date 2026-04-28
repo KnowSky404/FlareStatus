@@ -4,3 +4,6 @@
 /node_modules/
 /probe/node_modules/
 /probe/dist/
+/.env
+/.dev.vars
+/.deploy-secrets.local
