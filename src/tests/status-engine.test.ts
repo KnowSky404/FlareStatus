@@ -324,4 +324,69 @@ describe("recomputePublicStatus", () => {
       ),
     ).toBe(false);
   });
+
+  it("omits disabled services from the public snapshot", async () => {
+    listServicesWithComponents.mockResolvedValue({
+      services: [
+        createServiceRow(),
+        createServiceRow({
+          id: "svc_2",
+          slug: "codex",
+          name: "Codex",
+          enabled: 0,
+        }),
+      ],
+      components: [
+        createComponentRow(),
+        createComponentRow({
+          id: "cmp_2",
+          service_id: "svc_2",
+          slug: "codex-health",
+          name: "Codex Health",
+        }),
+      ],
+    });
+    listLatestProbeResults.mockResolvedValue([]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    const snapshot = await recomputePublicStatus(
+      {} as D1Database,
+      { put: vi.fn() } as unknown as KVNamespace,
+      "2026-04-28T00:00:00.000Z",
+    );
+
+    expect(snapshot.services.some((service) => service.slug === "codex")).toBe(
+      false,
+    );
+  });
+
+  it("does not let disabled components affect service aggregation", async () => {
+    listServicesWithComponents.mockResolvedValue({
+      services: [createServiceRow()],
+      components: [
+        createComponentRow({ observed_status: "operational" }),
+        createComponentRow({
+          id: "cmp_2",
+          slug: "public-api",
+          name: "Public API",
+          sort_order: 1,
+          enabled: 0,
+          observed_status: "major_outage",
+          display_status: "major_outage",
+        }),
+      ],
+    });
+    listLatestProbeResults.mockResolvedValue([]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    const snapshot = await recomputePublicStatus(
+      {} as D1Database,
+      { put: vi.fn() } as unknown as KVNamespace,
+      "2026-04-28T00:00:00.000Z",
+    );
+
+    expect(snapshot.services.find((service) => service.slug === "api")?.status).toBe(
+      "operational",
+    );
+  });
 });

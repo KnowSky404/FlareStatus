@@ -76,8 +76,14 @@ export async function recomputePublicStatus(
 
   const probeResultByComponentId = pickLatestProbeResult(latestProbeResults);
   const overrideByTarget = pickLatestOverride(activeOverrides);
+  const enabledServices = services.filter((service) => service.enabled === 1);
+  const enabledServiceIds = new Set(enabledServices.map((service) => service.id));
+  const enabledComponents = components.filter(
+    (component) =>
+      component.enabled === 1 && enabledServiceIds.has(component.service_id),
+  );
 
-  const componentStatusRows: ComponentStatusUpdateRow[] = components.map(
+  const componentStatusRows: ComponentStatusUpdateRow[] = enabledComponents.map(
     (component) => {
       const observedStatus: PublicStatus =
         probeResultByComponentId.get(component.id)?.status ??
@@ -101,8 +107,8 @@ export async function recomputePublicStatus(
     componentStatusRows.map((row) => [row.id, row] as const),
   );
 
-  const serviceStatusRows: ServiceStatusUpdateRow[] = services.map((service) => {
-    const serviceComponents = components
+  const serviceStatusRows: ServiceStatusUpdateRow[] = enabledServices.map((service) => {
+    const serviceComponents = enabledComponents
       .filter((component) => component.service_id === service.id)
       .map((component) => ({
         isCritical: component.is_critical === 1,
@@ -139,13 +145,13 @@ export async function recomputePublicStatus(
   );
   const snapshot = buildPublicSnapshot({
     generatedAt: nowIso,
-    services: services.map((service) => ({
+    services: enabledServices.map((service) => ({
       id: service.id,
       slug: service.slug,
       name: service.name,
       status: serviceStatusById.get(service.id) ?? service.status,
     })),
-    components: components.map((component) => ({
+    components: enabledComponents.map((component) => ({
       id: component.id,
       serviceId: component.service_id,
       slug: component.slug,

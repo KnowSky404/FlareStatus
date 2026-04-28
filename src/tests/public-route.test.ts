@@ -458,6 +458,81 @@ describe("public status route", () => {
     });
     expect(kvPut).toHaveBeenCalledTimes(1);
   });
+
+  it("omits disabled services and components when recomputing the public route", async () => {
+    listServicesWithComponents.mockResolvedValue({
+      services: [
+        createServiceRow({
+          id: "svc_1",
+          slug: "sub2api",
+          name: "Sub2API",
+        }),
+        createServiceRow({
+          id: "svc_2",
+          slug: "codex",
+          name: "Codex",
+          sort_order: 1,
+          enabled: 0,
+        }),
+      ],
+      components: [
+        createComponentRow({
+          id: "cmp_1",
+          service_id: "svc_1",
+          slug: "sub2api-health",
+          name: "Sub2API Health",
+        }),
+        createComponentRow({
+          id: "cmp_2",
+          service_id: "svc_1",
+          slug: "redis",
+          name: "Redis",
+          sort_order: 1,
+          enabled: 0,
+          observed_status: "major_outage",
+          display_status: "major_outage",
+        }),
+        createComponentRow({
+          id: "cmp_3",
+          service_id: "svc_2",
+          slug: "codex-health",
+          name: "Codex Health",
+          sort_order: 0,
+        }),
+      ],
+    });
+    listLatestProbeResults.mockResolvedValue([]);
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/public/status"),
+      createEnv({
+        db: createTimedWindowDb({ overrides: [], announcements: [] }),
+        kvPut: async () => undefined,
+      }),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    const payload = (await response.json()) as PublicStatusPayload;
+
+    expect(payload).toMatchObject({
+      services: [
+        {
+          slug: "sub2api",
+          status: "operational",
+          components: [
+            {
+              slug: "sub2api-health",
+              displayStatus: "operational",
+            },
+          ],
+        },
+      ],
+    });
+    expect(payload.services).toHaveLength(1);
+    expect(payload.services[0]?.components).toHaveLength(1);
+    expect(payload.services[0]?.components[0]?.slug).toBe("sub2api-health");
+  });
 });
 
 describe("public status shell", () => {
