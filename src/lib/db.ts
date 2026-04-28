@@ -151,6 +151,130 @@ export async function updateService(db: D1Database, input: UpdateServiceInput) {
   };
 }
 
+export interface CreateComponentInput {
+  serviceSlug: string;
+  slug: string;
+  name: string;
+  description: string;
+  probeType: ComponentRow["probe_type"];
+  isCritical: boolean;
+  sortOrder: number;
+  enabled: boolean;
+  updatedAt: string;
+}
+
+export async function createComponent(
+  db: D1Database,
+  input: CreateComponentInput,
+) {
+  const result = await db
+    .prepare(
+      `INSERT INTO components (id, service_id, slug, name, description, probe_type, is_critical, sort_order, enabled, observed_status, display_status, updated_at)
+       SELECT ?, id, ?, ?, ?, ?, ?, ?, ?, 'operational', 'operational', ?
+       FROM services
+       WHERE slug = ?`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      input.slug,
+      input.name,
+      input.description,
+      input.probeType,
+      input.isCritical ? 1 : 0,
+      input.sortOrder,
+      input.enabled ? 1 : 0,
+      input.updatedAt,
+      input.serviceSlug,
+    )
+    .run();
+
+  return {
+    changes: result.meta.changes,
+  };
+}
+
+export interface UpdateComponentInput {
+  currentSlug: string;
+  slug?: string;
+  name?: string;
+  description?: string;
+  probeType?: ComponentRow["probe_type"];
+  isCritical?: boolean;
+  sortOrder?: number;
+  enabled?: boolean;
+  updatedAt: string;
+}
+
+export async function updateComponent(
+  db: D1Database,
+  input: UpdateComponentInput,
+) {
+  const result = await db
+    .prepare(
+      `UPDATE components
+       SET slug = COALESCE(?, slug),
+           name = COALESCE(?, name),
+           description = COALESCE(?, description),
+           probe_type = COALESCE(?, probe_type),
+           is_critical = COALESCE(?, is_critical),
+           sort_order = COALESCE(?, sort_order),
+           enabled = COALESCE(?, enabled),
+           updated_at = ?
+       WHERE slug = ?`,
+    )
+    .bind(
+      input.slug ?? null,
+      input.name ?? null,
+      input.description ?? null,
+      input.probeType ?? null,
+      input.isCritical === undefined ? null : input.isCritical ? 1 : 0,
+      input.sortOrder ?? null,
+      input.enabled === undefined ? null : input.enabled ? 1 : 0,
+      input.updatedAt,
+      input.currentSlug,
+    )
+    .run();
+
+  return {
+    changes: result.meta.changes,
+  };
+}
+
+export interface ReorderCatalogInput {
+  serviceSorts: Array<{ slug: string; sortOrder: number }>;
+  componentSorts: Array<{ slug: string; sortOrder: number }>;
+  updatedAt: string;
+}
+
+export async function reorderCatalog(db: D1Database, input: ReorderCatalogInput) {
+  const statements = [
+    ...input.serviceSorts.map((service) =>
+      db
+        .prepare(
+          `UPDATE services
+           SET sort_order = ?, updated_at = ?
+           WHERE slug = ?`,
+        )
+        .bind(service.sortOrder, input.updatedAt, service.slug),
+    ),
+    ...input.componentSorts.map((component) =>
+      db
+        .prepare(
+          `UPDATE components
+           SET sort_order = ?, updated_at = ?
+           WHERE slug = ?`,
+        )
+        .bind(component.sortOrder, input.updatedAt, component.slug),
+    ),
+  ];
+
+  if (statements.length === 0) {
+    return;
+  }
+
+  await db.batch(statements);
+}
+
 export async function listServicesWithComponents(db: D1Database) {
   const services = await db
     .prepare("SELECT * FROM services ORDER BY sort_order")

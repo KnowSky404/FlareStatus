@@ -21,6 +21,30 @@ const UPDATE_SERVICE_SQL = `UPDATE services
            enabled = COALESCE(?, enabled),
            updated_at = ?
        WHERE slug = ?`;
+const INSERT_COMPONENT_SQL = `INSERT INTO components (id, service_id, slug, name, description, probe_type, is_critical, sort_order, enabled, observed_status, display_status, updated_at)
+       SELECT ?, id, ?, ?, ?, ?, ?, ?, ?, 'operational', 'operational', ?
+       FROM services
+       WHERE slug = ?`;
+const UPDATE_COMPONENT_SQL = `UPDATE components
+       SET slug = COALESCE(?, slug),
+           name = COALESCE(?, name),
+           description = COALESCE(?, description),
+           probe_type = COALESCE(?, probe_type),
+           is_critical = COALESCE(?, is_critical),
+           sort_order = COALESCE(?, sort_order),
+           enabled = COALESCE(?, enabled),
+           updated_at = ?
+       WHERE slug = ?`;
+const UPDATE_SERVICE_ORDER_SQL = `UPDATE services
+       SET sort_order = ?, updated_at = ?
+       WHERE slug = ?`;
+const UPDATE_COMPONENT_ORDER_SQL = `UPDATE components
+       SET sort_order = ?, updated_at = ?
+       WHERE slug = ?`;
+
+function normalizeSql(sql: string) {
+  return sql.replace(/\s+/g, " ").trim();
+}
 
 vi.mock("../lib/status-engine", () => ({
   recomputePublicStatus: vi.fn(),
@@ -444,6 +468,273 @@ describe("admin override route", () => {
     expect(response.status).toBe(409);
     await expect(response.text()).resolves.toBe("service slug already exists");
     expect(recomputePublicStatus).not.toHaveBeenCalled();
+  });
+
+  it("creates a component under an existing service", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T12:00:00.000Z"));
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("component-123");
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(INSERT_COMPONENT_SQL);
+
+        return {
+          bind: (...params: unknown[]) => {
+            expect(params).toEqual([
+              "component-123",
+              "sub2api-health",
+              "Health",
+              "Health endpoint",
+              "http",
+              1,
+              30,
+              1,
+              "2026-04-27T12:00:00.000Z",
+              "sub2api",
+            ]);
+
+            return {
+              run: async () => ({ meta: { changes: 1 } }),
+            };
+          },
+        } as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/components", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          serviceSlug: "sub2api",
+          slug: "sub2api-health",
+          name: "Health",
+          description: "Health endpoint",
+          probeType: "http",
+          isCritical: true,
+          sortOrder: 30,
+          enabled: true,
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toEqual({ created: true });
+  });
+
+  it("updates a component and recomputes the public snapshot", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T12:30:00.000Z"));
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(UPDATE_COMPONENT_SQL);
+
+        return {
+          bind: (...params: unknown[]) => {
+            expect(params).toEqual([
+              "sub2api-healthz",
+              "Healthz",
+              "Renamed health endpoint",
+              "tcp",
+              0,
+              40,
+              0,
+              "2026-04-27T12:30:00.000Z",
+              "sub2api-health",
+            ]);
+
+            return {
+              run: async () => ({ meta: { changes: 1 } }),
+            };
+          },
+        } as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/components/sub2api-health", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "sub2api-healthz",
+          name: "Healthz",
+          description: "Renamed health endpoint",
+          probeType: "tcp",
+          isCritical: false,
+          sortOrder: 40,
+          enabled: false,
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ updated: true });
+    expect(recomputePublicStatus).toHaveBeenCalledWith(
+      env.DB,
+      env.STATUS_SNAPSHOTS,
+      "2026-04-27T12:30:00.000Z",
+    );
+  });
+
+  it("returns 400 for invalid component payloads", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/components", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          serviceSlug: "sub2api",
+          slug: "bad/slug",
+          name: "Health",
+          probeType: "invalid",
+        }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
+  it("returns 409 when component create hits a duplicate slug conflict", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T12:00:00.000Z"));
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("component-123");
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(INSERT_COMPONENT_SQL);
+
+        return {
+          bind: () => ({
+            run: async () => {
+              throw new Error("D1_ERROR: UNIQUE constraint failed: components.slug");
+            },
+          }),
+        } as unknown as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/components", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          serviceSlug: "sub2api",
+          slug: "sub2api-health",
+          name: "Health",
+          probeType: "http",
+          isCritical: true,
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.text()).resolves.toBe("component slug already exists");
+    expect(recomputePublicStatus).not.toHaveBeenCalled();
+  });
+
+  it("reorders services and components in one request", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T13:00:00.000Z"));
+
+    const prepare = vi.fn((sql: string) => {
+      const normalizedSql = normalizeSql(sql);
+
+      if (
+        normalizedSql === normalizeSql(UPDATE_SERVICE_ORDER_SQL) ||
+        normalizedSql === normalizeSql(UPDATE_COMPONENT_ORDER_SQL)
+      ) {
+        return {
+          bind: (...params: unknown[]) => ({
+            sql: normalizedSql,
+            params,
+          }),
+        } as unknown as D1PreparedStatement;
+      }
+
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    const batch = vi.fn(async () => []);
+
+    const env = {
+      ...createEnv({ prepare }),
+      DB: {
+        prepare,
+        batch,
+      } as unknown as D1Database,
+    };
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog/reorder", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          services: [{ slug: "sub2api", sortOrder: 20 }],
+          components: [{ slug: "sub2api-postgres", sortOrder: 10 }],
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ updated: true });
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(batch).toHaveBeenCalledWith([
+      {
+        sql: normalizeSql(UPDATE_SERVICE_ORDER_SQL),
+        params: [20, "2026-04-27T13:00:00.000Z", "sub2api"],
+      },
+      {
+        sql: normalizeSql(UPDATE_COMPONENT_ORDER_SQL),
+        params: [10, "2026-04-27T13:00:00.000Z", "sub2api-postgres"],
+      },
+    ]);
+  });
+
+  it("returns 400 for invalid reorder payloads", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog/reorder", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          services: [{ slug: "sub2api", sortOrder: "high" }],
+          components: [],
+        }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
   });
 
   it("rejects unauthorized requests", async () => {
