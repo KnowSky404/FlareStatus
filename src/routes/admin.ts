@@ -58,6 +58,7 @@ const ADMIN_OVERRIDE_STATUSES = new Set([
   "partial_outage",
   "major_outage",
 ]);
+const ADMIN_SERVICE_SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const ISO_UTC_TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
@@ -138,6 +139,10 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function isAdminServiceSlug(value: unknown): value is string {
+  return typeof value === "string" && ADMIN_SERVICE_SLUG_PATTERN.test(value);
+}
+
 function isOptionalInteger(value: unknown) {
   return value === undefined || (typeof value === "number" && Number.isInteger(value));
 }
@@ -152,7 +157,7 @@ function isAdminCreateServicePayload(
   const candidate = payload as Record<string, unknown>;
 
   return (
-    isNonEmptyString(candidate.slug) &&
+    isAdminServiceSlug(candidate.slug) &&
     isNonEmptyString(candidate.name) &&
     (candidate.description === undefined || typeof candidate.description === "string") &&
     isOptionalInteger(candidate.sortOrder) &&
@@ -183,11 +188,18 @@ function isAdminUpdateServicePayload(
   }
 
   return (
-    (candidate.slug === undefined || isNonEmptyString(candidate.slug)) &&
+    (candidate.slug === undefined || isAdminServiceSlug(candidate.slug)) &&
     (candidate.name === undefined || isNonEmptyString(candidate.name)) &&
     (candidate.description === undefined || typeof candidate.description === "string") &&
     isOptionalInteger(candidate.sortOrder) &&
     (candidate.enabled === undefined || typeof candidate.enabled === "boolean")
+  );
+}
+
+function isServiceSlugConflictError(error: unknown) {
+  return (
+    error instanceof Error &&
+    error.message.includes("UNIQUE constraint failed: services.slug")
   );
 }
 
@@ -395,15 +407,23 @@ export async function handleAdminCreateService(
 
   const nowIso = new Date().toISOString();
 
-  await createService(env.DB, {
-    slug: payload.slug,
-    name: payload.name,
-    description: payload.description ?? "",
-    sortOrder: payload.sortOrder ?? 0,
-    enabled: payload.enabled ?? true,
-    status: payload.status ?? "operational",
-    updatedAt: nowIso,
-  });
+  try {
+    await createService(env.DB, {
+      slug: payload.slug,
+      name: payload.name,
+      description: payload.description ?? "",
+      sortOrder: payload.sortOrder ?? 0,
+      enabled: payload.enabled ?? true,
+      status: payload.status ?? "operational",
+      updatedAt: nowIso,
+    });
+  } catch (error) {
+    if (isServiceSlugConflictError(error)) {
+      return new Response("service slug already exists", { status: 409 });
+    }
+
+    throw error;
+  }
 
   schedulePublicStatusRecompute(ctx, env, nowIso, "admin service create");
 
@@ -429,15 +449,25 @@ export async function handleAdminUpdateService(
   }
 
   const nowIso = new Date().toISOString();
-  const result = await updateService(env.DB, {
-    currentSlug,
-    slug: payload.slug,
-    name: payload.name,
-    description: payload.description,
-    sortOrder: payload.sortOrder,
-    enabled: payload.enabled,
-    updatedAt: nowIso,
-  });
+  let result: { changes: number };
+
+  try {
+    result = await updateService(env.DB, {
+      currentSlug,
+      slug: payload.slug,
+      name: payload.name,
+      description: payload.description,
+      sortOrder: payload.sortOrder,
+      enabled: payload.enabled,
+      updatedAt: nowIso,
+    });
+  } catch (error) {
+    if (isServiceSlugConflictError(error)) {
+      return new Response("service slug already exists", { status: 409 });
+    }
+
+    throw error;
+  }
 
   if (result.changes === 0) {
     return new Response("service not found", { status: 404 });

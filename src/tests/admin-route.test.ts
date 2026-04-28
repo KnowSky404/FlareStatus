@@ -197,6 +197,27 @@ describe("admin override route", () => {
     await expect(response.text()).resolves.toBe("invalid payload");
   });
 
+  it("returns 400 when service create slug is not route-addressable", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "bad/slug",
+          name: "Sub2API Core",
+        }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
   it("creates a service and recomputes the public snapshot", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T10:00:00.000Z"));
@@ -254,6 +275,46 @@ describe("admin override route", () => {
       env.STATUS_SNAPSHOTS,
       "2026-04-27T10:00:00.000Z",
     );
+  });
+
+  it("returns 409 when service create hits a duplicate slug conflict", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T10:00:00.000Z"));
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("service-123");
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(INSERT_SERVICE_SQL);
+
+        return {
+          bind: () => ({
+            run: async () => {
+              throw new Error("D1_ERROR: UNIQUE constraint failed: services.slug");
+            },
+          }),
+        } as unknown as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "sub2api-core",
+          name: "Sub2API Core",
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.text()).resolves.toBe("service slug already exists");
+    expect(recomputePublicStatus).not.toHaveBeenCalled();
   });
 
   it("updates a service name and enabled flag", async () => {
@@ -325,6 +386,64 @@ describe("admin override route", () => {
 
     expect(response.status).toBe(400);
     await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
+  it("returns 400 when service update slug is not route-addressable", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services/sub2api", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "bad/slug",
+        }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
+  it("returns 409 when service update hits a duplicate slug conflict", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T11:00:00.000Z"));
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(UPDATE_SERVICE_SQL);
+
+        return {
+          bind: () => ({
+            run: async () => {
+              throw new Error("D1_ERROR: UNIQUE constraint failed: services.slug");
+            },
+          }),
+        } as unknown as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services/sub2api", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "sub2api-core",
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(409);
+    await expect(response.text()).resolves.toBe("service slug already exists");
+    expect(recomputePublicStatus).not.toHaveBeenCalled();
   });
 
   it("rejects unauthorized requests", async () => {
