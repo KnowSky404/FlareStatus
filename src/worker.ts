@@ -1,6 +1,12 @@
 import type { Env } from "./lib/env";
 import { matchesRoute } from "./lib/http";
-import { handleAdminAnnouncement, handleAdminOverride } from "./routes/admin";
+import {
+  handleAdminAnnouncement,
+  handleAdminCatalog,
+  handleAdminCreateService,
+  handleAdminOverride,
+  handleAdminUpdateService,
+} from "./routes/admin";
 import { handleAssetRequest } from "./routes/assets";
 import { handleProbeReport } from "./routes/probe";
 import { handlePublicStatus } from "./routes/public";
@@ -17,6 +23,26 @@ const worker = {
 
     if (matchesRoute(request, "POST", "/api/admin/announcements")) {
       return handleAdminAnnouncement(request, env, ctx);
+    }
+
+    if (matchesRoute(request, "GET", "/api/admin/catalog")) {
+      return handleAdminCatalog(request, env);
+    }
+
+    if (matchesRoute(request, "POST", "/api/admin/services")) {
+      return handleAdminCreateService(request, env, ctx);
+    }
+
+    if (request.method === "PATCH") {
+      const url = new URL(request.url);
+
+      if (url.pathname.startsWith("/api/admin/services/")) {
+        const slug = url.pathname.slice("/api/admin/services/".length);
+
+        if (slug.length > 0 && !slug.includes("/")) {
+          return handleAdminUpdateService(request, env, ctx, slug);
+        }
+      }
     }
 
     if (matchesRoute(request, "GET", "/api/public/status")) {

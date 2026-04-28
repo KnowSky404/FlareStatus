@@ -80,6 +80,77 @@ export async function createAnnouncement(
   };
 }
 
+export interface CreateServiceInput {
+  slug: string;
+  name: string;
+  description: string;
+  sortOrder: number;
+  enabled: boolean;
+  status: "operational" | "degraded" | "partial_outage" | "major_outage";
+  updatedAt: string;
+}
+
+export async function createService(db: D1Database, input: CreateServiceInput) {
+  const result = await db
+    .prepare(
+      `INSERT INTO services (id, slug, name, description, sort_order, enabled, status, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      input.slug,
+      input.name,
+      input.description,
+      input.sortOrder,
+      input.enabled ? 1 : 0,
+      input.status,
+      input.updatedAt,
+    )
+    .run();
+
+  return {
+    changes: result.meta.changes,
+  };
+}
+
+export interface UpdateServiceInput {
+  currentSlug: string;
+  slug?: string;
+  name?: string;
+  description?: string;
+  sortOrder?: number;
+  enabled?: boolean;
+  updatedAt: string;
+}
+
+export async function updateService(db: D1Database, input: UpdateServiceInput) {
+  const result = await db
+    .prepare(
+      `UPDATE services
+       SET slug = COALESCE(?, slug),
+           name = COALESCE(?, name),
+           description = COALESCE(?, description),
+           sort_order = COALESCE(?, sort_order),
+           enabled = COALESCE(?, enabled),
+           updated_at = ?
+       WHERE slug = ?`,
+    )
+    .bind(
+      input.slug ?? null,
+      input.name ?? null,
+      input.description ?? null,
+      input.sortOrder ?? null,
+      input.enabled === undefined ? null : input.enabled ? 1 : 0,
+      input.updatedAt,
+      input.currentSlug,
+    )
+    .run();
+
+  return {
+    changes: result.meta.changes,
+  };
+}
+
 export async function listServicesWithComponents(db: D1Database) {
   const services = await db
     .prepare("SELECT * FROM services ORDER BY sort_order")

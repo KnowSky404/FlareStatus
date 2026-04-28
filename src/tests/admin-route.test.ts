@@ -9,6 +9,18 @@ const OVERRIDE_SQL = `INSERT INTO overrides (id, target_type, target_id, overrid
        WHERE slug = ?`;
 const ANNOUNCEMENT_SQL = `INSERT INTO announcements (id, title, body, status_level, starts_at, ends_at, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`;
+const LIST_SERVICES_SQL = "SELECT * FROM services ORDER BY sort_order";
+const LIST_COMPONENTS_SQL = "SELECT * FROM components ORDER BY sort_order";
+const INSERT_SERVICE_SQL = `INSERT INTO services (id, slug, name, description, sort_order, enabled, status, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+const UPDATE_SERVICE_SQL = `UPDATE services
+       SET slug = COALESCE(?, slug),
+           name = COALESCE(?, name),
+           description = COALESCE(?, description),
+           sort_order = COALESCE(?, sort_order),
+           enabled = COALESCE(?, enabled),
+           updated_at = ?
+       WHERE slug = ?`;
 
 vi.mock("../lib/status-engine", () => ({
   recomputePublicStatus: vi.fn(),
@@ -67,6 +79,254 @@ beforeEach(() => {
 });
 
 describe("admin override route", () => {
+  it("returns the editable service catalog with nested components", async () => {
+    const env = createEnv({
+      prepare: (sql: string) => {
+        if (sql === LIST_SERVICES_SQL) {
+          return {
+            all: async () => ({
+              results: [
+                {
+                  id: "svc_1",
+                  slug: "sub2api",
+                  name: "Sub2API",
+                  description: "Primary API",
+                  sort_order: 0,
+                  enabled: 1,
+                  status: "operational",
+                  updated_at: "2026-04-27T00:00:00.000Z",
+                },
+              ],
+            }),
+          } as D1PreparedStatement;
+        }
+
+        expect(sql).toBe(LIST_COMPONENTS_SQL);
+
+        return {
+          all: async () => ({
+            results: [
+              {
+                id: "cmp_1",
+                service_id: "svc_1",
+                slug: "sub2api-public-api",
+                name: "Public API",
+                description: "Customer traffic",
+                probe_type: "http",
+                is_critical: 1,
+                sort_order: 0,
+                enabled: 1,
+                observed_status: "operational",
+                display_status: "operational",
+                updated_at: "2026-04-27T00:00:00.000Z",
+              },
+            ],
+          }),
+        } as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog", {
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      services: [
+        {
+          id: "svc_1",
+          slug: "sub2api",
+          name: "Sub2API",
+          description: "Primary API",
+          sortOrder: 0,
+          enabled: true,
+          status: "operational",
+          components: [
+            {
+              id: "cmp_1",
+              serviceId: "svc_1",
+              slug: "sub2api-public-api",
+              name: "Public API",
+              description: "Customer traffic",
+              probeType: "http",
+              isCritical: true,
+              sortOrder: 0,
+              enabled: true,
+              observedStatus: "operational",
+              displayStatus: "operational",
+            },
+          ],
+        },
+      ],
+    });
+  });
+
+  it("rejects unauthorized catalog requests", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog"),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.text()).resolves.toBe("unauthorized");
+  });
+
+  it("returns 400 for invalid service create payloads", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "",
+          name: 42,
+        }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
+  it("creates a service and recomputes the public snapshot", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T10:00:00.000Z"));
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("service-123");
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(INSERT_SERVICE_SQL);
+
+        return {
+          bind: (...params: unknown[]) => {
+            expect(params).toEqual([
+              "service-123",
+              "sub2api-core",
+              "Sub2API Core",
+              "Primary API",
+              2,
+              0,
+              "degraded",
+              "2026-04-27T10:00:00.000Z",
+            ]);
+
+            return {
+              run: async () => ({ meta: { changes: 1 } }),
+            };
+          },
+        } as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "sub2api-core",
+          name: "Sub2API Core",
+          description: "Primary API",
+          sortOrder: 2,
+          enabled: false,
+          status: "degraded",
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(201);
+    await expect(response.json()).resolves.toEqual({ created: true });
+    expect(recomputePublicStatus).toHaveBeenCalledWith(
+      env.DB,
+      env.STATUS_SNAPSHOTS,
+      "2026-04-27T10:00:00.000Z",
+    );
+  });
+
+  it("updates a service name and enabled flag", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-27T11:00:00.000Z"));
+
+    const env = createEnv({
+      prepare: (sql: string) => {
+        expect(sql).toBe(UPDATE_SERVICE_SQL);
+
+        return {
+          bind: (...params: unknown[]) => {
+            expect(params).toEqual([
+              "sub2api-core",
+              "Sub2API Core",
+              "Renamed primary API",
+              3,
+              0,
+              "2026-04-27T11:00:00.000Z",
+              "sub2api",
+            ]);
+
+            return {
+              run: async () => ({ meta: { changes: 1 } }),
+            };
+          },
+        } as D1PreparedStatement;
+      },
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services/sub2api", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "sub2api-core",
+          name: "Sub2API Core",
+          description: "Renamed primary API",
+          sortOrder: 3,
+          enabled: false,
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ updated: true });
+  });
+
+  it("returns 400 for invalid service update payloads", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services/sub2api", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          enabled: "no",
+        }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(400);
+    await expect(response.text()).resolves.toBe("invalid payload");
+  });
+
   it("rejects unauthorized requests", async () => {
     const request = new Request("https://flarestatus.test/api/admin/overrides", {
       method: "POST",
