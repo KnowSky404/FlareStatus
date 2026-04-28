@@ -109,16 +109,37 @@ const AsyncFunction = async function () {}.constructor as new (
   ...args: string[]
 ) => (...args: unknown[]) => Promise<unknown>;
 
+interface MockElement {
+  textContent: string;
+  innerHTML: string;
+}
+
 async function runPublicApp({
   fetchImpl,
-  summaryEl = { textContent: "Loading current system status..." },
+  summaryEl = {
+    textContent: "Loading current system status...",
+    innerHTML: "",
+  },
+  announcementListEl = { textContent: "", innerHTML: "" },
+  serviceListEl = { textContent: "", innerHTML: "" },
 }: {
   fetchImpl: typeof fetch;
-  summaryEl?: { textContent: string } | null;
+  summaryEl?: MockElement | null;
+  announcementListEl?: MockElement | null;
+  serviceListEl?: MockElement | null;
 }) {
+  const elementsBySelector = new Map<string, MockElement | null>([
+    ["#summary", summaryEl],
+    ["#announcement-list", announcementListEl],
+    ["#service-list", serviceListEl],
+  ]);
+
   const querySelector = (selector: string) => {
-    expect(selector).toBe("#summary");
-    return summaryEl;
+    if (!elementsBySelector.has(selector)) {
+      throw new Error(`Unexpected selector: ${selector}`);
+    }
+
+    return elementsBySelector.get(selector) ?? null;
   };
 
   const runScript = new AsyncFunction(
@@ -129,7 +150,11 @@ async function runPublicApp({
 
   await runScript(fetchImpl, { querySelector });
 
-  return summaryEl;
+  return {
+    summaryEl,
+    announcementListEl,
+    serviceListEl,
+  };
 }
 
 const listServicesWithComponents = vi.mocked(dbModule.listServicesWithComponents);
@@ -439,6 +464,8 @@ describe("public status shell", () => {
     expect(html).toContain('id="summary"');
     expect(html).toContain('id="services"');
     expect(html).toContain('id="announcements"');
+    expect(html).toContain('id="announcement-list"');
+    expect(html).toContain('id="service-list"');
     expect(html).toContain("Announcements");
     expect(html).toContain("No active announcements.");
     expect(html).toContain("Services");
@@ -451,7 +478,7 @@ describe("public status shell", () => {
   });
 
   it("updates the summary from the fetched status snapshot", async () => {
-    const summaryEl = await runPublicApp({
+    const { summaryEl } = await runPublicApp({
       fetchImpl: async (input: RequestInfo | URL) => {
         expect(input).toBe("/api/public/status");
 
@@ -465,8 +492,80 @@ describe("public status shell", () => {
     expect(summaryEl?.textContent).toBe("All Systems Operational");
   });
 
+  it("renders announcements and service/component details from the fetched snapshot", async () => {
+    const { announcementListEl, serviceListEl } = await runPublicApp({
+      fetchImpl: async () =>
+        ({
+          ok: true,
+          json: async () => ({
+            summary: { status: "partial_outage" },
+            announcements: [
+              {
+                id: "ann_1",
+                title: "Latency incident",
+                body: "Investigating elevated latency",
+              },
+            ],
+            services: [
+              {
+                id: "svc_1",
+                slug: "sub2api",
+                name: "Sub2API",
+                status: "partial_outage",
+                components: [
+                  {
+                    id: "cmp_1",
+                    serviceId: "svc_1",
+                    slug: "redis",
+                    name: "Redis",
+                    displayStatus: "degraded",
+                  },
+                ],
+              },
+            ],
+          }),
+        }) as Response,
+    });
+
+    expect(announcementListEl?.innerHTML).toContain("Latency incident");
+    expect(announcementListEl?.innerHTML).toContain("Investigating elevated latency");
+    expect(serviceListEl?.innerHTML).toContain("Sub2API");
+    expect(serviceListEl?.innerHTML).toContain("Redis");
+    expect(serviceListEl?.innerHTML).toContain("Partial outage");
+    expect(serviceListEl?.innerHTML).toContain("Degraded performance");
+  });
+
+  it("uses readable non-operational summary wording for degraded states", async () => {
+    const partialOutage = await runPublicApp({
+      fetchImpl: async () =>
+        ({
+          ok: true,
+          json: async () => ({ summary: { status: "partial_outage" } }),
+        }) as Response,
+    });
+    expect(partialOutage.summaryEl?.textContent).toBe("Partial outage");
+
+    const degraded = await runPublicApp({
+      fetchImpl: async () =>
+        ({
+          ok: true,
+          json: async () => ({ summary: { status: "degraded" } }),
+        }) as Response,
+    });
+    expect(degraded.summaryEl?.textContent).toBe("Degraded performance");
+
+    const majorOutage = await runPublicApp({
+      fetchImpl: async () =>
+        ({
+          ok: true,
+          json: async () => ({ summary: { status: "major_outage" } }),
+        }) as Response,
+    });
+    expect(majorOutage.summaryEl?.textContent).toBe("Major outage");
+  });
+
   it("falls back when the status request fails", async () => {
-    const summaryEl = await runPublicApp({
+    const { summaryEl } = await runPublicApp({
       fetchImpl: async () => {
         throw new Error("network failed");
       },
@@ -476,14 +575,14 @@ describe("public status shell", () => {
   });
 
   it("does nothing when the summary element is missing", async () => {
-    await expect(
-      runPublicApp({
-        fetchImpl: async () => {
-          throw new Error("should not be reached");
-        },
-        summaryEl: null,
-      }),
-    ).resolves.toBeNull();
+    const result = await runPublicApp({
+      fetchImpl: async () => {
+        throw new Error("should not be reached");
+      },
+      summaryEl: null,
+    });
+
+    expect(result.summaryEl).toBeNull();
   });
 });
 
