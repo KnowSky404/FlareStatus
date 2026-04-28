@@ -304,7 +304,7 @@ describe("recomputePublicStatus", () => {
             sort_order: 1,
           }),
           enabled: 0,
-        } as ComponentRow,
+        },
       ],
     });
     listLatestProbeResults.mockResolvedValue([]);
