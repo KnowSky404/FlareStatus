@@ -5,6 +5,7 @@
 This guide covers day-2 operation of FlareStatus:
 
 - checking health
+- operating the admin console
 - posting overrides
 - posting announcements
 - validating probe flow
@@ -26,6 +27,71 @@ Key fields:
 - `services[].components[].displayStatus`: component-level status shown publicly
 
 ## Operator Actions
+
+## Admin Console
+
+Open:
+
+```text
+https://<worker-host>/admin
+```
+
+Recommended protection model:
+
+- place `/admin` behind Cloudflare Access or an equivalent edge access layer
+- keep `ADMIN_API_TOKEN` restricted to operators
+
+Current UI behavior:
+
+- the page loads public preview data without the admin token
+- editable catalog and write operations require an `ADMIN_API_TOKEN`
+- the page stores the token in browser local storage for the current browser profile
+
+Use the admin console for:
+
+- creating and editing services
+- creating and editing components
+- enabling or disabling services/components
+- posting overrides
+- posting announcements
+
+Disabled catalog rows remain editable in `/admin` but are hidden from `/api/public/status`.
+
+## Catalog API Examples
+
+Read the editable catalog:
+
+```bash
+curl https://<worker-host>/api/admin/catalog \
+  -H 'Authorization: Bearer <admin-token>'
+```
+
+Create a service:
+
+```bash
+curl -X POST https://<worker-host>/api/admin/services \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' \
+  --data '{"slug":"sub2api-core","name":"Sub2API Core","description":"Primary API","sortOrder":10,"enabled":true}'
+```
+
+Create a component:
+
+```bash
+curl -X POST https://<worker-host>/api/admin/components \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' \
+  --data '{"serviceSlug":"sub2api","slug":"sub2api-health","name":"Health","probeType":"http","isCritical":true,"sortOrder":20,"enabled":true}'
+```
+
+Batch reorder:
+
+```bash
+curl -X POST https://<worker-host>/api/admin/catalog/reorder \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' \
+  --data '{"services":[{"slug":"sub2api","sortOrder":10}],"components":[{"slug":"sub2api-health","sortOrder":20}]}'
+```
 
 ## Apply an override
 
@@ -117,8 +183,10 @@ Use this checklist after deployment or incident recovery:
 1. `GET /api/public/status` returns `200`
 2. `services` is populated
 3. a one-shot probe can post successfully
-4. an override changes the visible service/component status
-5. an announcement appears in `announcements`
+4. `/admin` loads and can fetch `/api/admin/catalog`
+5. disabling a component removes it from `services[].components`
+6. an override changes the visible service/component status
+7. an announcement appears in `announcements`
 
 ## Troubleshooting
 
@@ -138,6 +206,7 @@ Check:
 
 - the Worker secret `ADMIN_API_TOKEN`
 - the token used in the admin request
+- whether the browser token stored in `/admin` is stale
 
 ## `404 component not found` on probe ingest
 
@@ -178,6 +247,7 @@ Shell exports alone may not be sufficient for local Worker bindings in every env
 Repository verification:
 
 ```bash
+pnpm vitest run src/tests/admin-route.test.ts src/tests/public-route.test.ts src/tests/status-engine.test.ts
 pnpm test
 pnpm --filter probe test
 pnpm typecheck

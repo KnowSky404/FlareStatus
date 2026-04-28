@@ -75,6 +75,38 @@ pnpm --filter probe start
 
 ## Admin and public APIs
 
+Admin console:
+
+- public status page: `/`
+- admin console: `/admin`
+
+The current admin console is intended to sit behind Cloudflare Access or another edge access layer. The browser UI still needs an `ADMIN_API_TOKEN` for write calls today, so the page exposes a session-scoped API token field instead of a full login flow.
+
+Catalog APIs:
+
+```bash
+curl http://127.0.0.1:8787/api/admin/catalog \
+  -H 'Authorization: Bearer test-admin-token'
+```
+
+Create a service:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/admin/services \
+  -H 'Authorization: Bearer test-admin-token' \
+  -H 'Content-Type: application/json' \
+  --data '{"slug":"sub2api-core","name":"Sub2API Core","description":"Primary API","sortOrder":10,"enabled":true}'
+```
+
+Create a component:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/admin/components \
+  -H 'Authorization: Bearer test-admin-token' \
+  -H 'Content-Type: application/json' \
+  --data '{"serviceSlug":"sub2api","slug":"sub2api-health","name":"Health","probeType":"http","isCritical":true,"sortOrder":20,"enabled":true}'
+```
+
 Create an override:
 
 ```bash
@@ -132,9 +164,12 @@ The response shape is:
 }
 ```
 
+Disabled services and components remain in the editable admin catalog, but are removed from the public snapshot and do not participate in service aggregation.
+
 ## Verification
 
 - `pnpm test`
+- `pnpm vitest run src/tests/admin-route.test.ts src/tests/public-route.test.ts src/tests/status-engine.test.ts`
 - `pnpm --filter probe test`
 - `pnpm typecheck`
 - `pnpm --filter probe exec tsc -p tsconfig.json --noEmit`
