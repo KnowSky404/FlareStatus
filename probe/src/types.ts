@@ -34,12 +34,20 @@ export interface PostgresCheckConfig {
 }
 
 export interface ProbeConfig {
+  intervalMs: number;
+  runOnce?: boolean;
   componentSlug: string;
   reportEndpoint: string;
   reportToken: string;
-  httpCheck: HttpCheckConfig;
+  check: ProbeCheckConfig;
 }
 
 export interface ProbeReportPayload extends CheckResult {
   componentSlug: string;
 }
+
+export type ProbeCheckConfig =
+  | ({ type: "http" } & HttpCheckConfig)
+  | ({ type: "tcp" } & TcpCheckConfig)
+  | ({ type: "redis" } & RedisCheckConfig)
+  | ({ type: "postgres" } & PostgresCheckConfig);
