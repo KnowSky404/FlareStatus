@@ -140,4 +140,8 @@ The response shape is:
 - `pnpm --filter probe exec tsc -p tsconfig.json --noEmit`
 - `pnpm wrangler dev --remote`: requires a logged-in Wrangler session in the current repo state.
 
-More detail: [`docs/runbooks/local-development.md`](docs/runbooks/local-development.md)
+Runbooks:
+
+- [Local Development](docs/runbooks/local-development.md)
+- [Deployment Guide](docs/runbooks/deployment.md)
+- [Operations Guide](docs/runbooks/operations.md)
