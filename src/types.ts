@@ -19,6 +19,7 @@ export interface ServiceRow {
   name: string;
   description: string;
   sort_order: number;
+  enabled: number;
   status: PublicStatus;
   updated_at: string;
 }
@@ -32,6 +33,7 @@ export interface ComponentRow {
   probe_type: ProbeType;
   is_critical: number;
   sort_order: number;
+  enabled: number;
   observed_status: PublicStatus;
   display_status: PublicStatus;
   updated_at: string;

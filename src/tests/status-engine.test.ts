@@ -30,6 +30,7 @@ function createServiceRow(overrides: Partial<ServiceRow> = {}): ServiceRow {
     name: "API",
     description: "",
     sort_order: 0,
+    enabled: 1,
     status: "operational",
     updated_at: "2026-04-27T00:00:00.000Z",
     ...overrides,
@@ -46,6 +47,7 @@ function createComponentRow(overrides: Partial<ComponentRow> = {}): ComponentRow
     probe_type: "http",
     is_critical: 1,
     sort_order: 0,
+    enabled: 1,
     observed_status: "operational",
     display_status: "operational",
     updated_at: "2026-04-27T00:00:00.000Z",
@@ -287,5 +289,39 @@ describe("recomputePublicStatus", () => {
     expect(snapshot.services[0]?.components[0]?.displayStatus).toBe(
       "operational",
     );
+  });
+
+  it("ignores disabled components when building the public snapshot", async () => {
+    listServicesWithComponents.mockResolvedValue({
+      services: [createServiceRow()],
+      components: [
+        createComponentRow(),
+        {
+          ...createComponentRow({
+            id: "cmp_2",
+            slug: "public-api",
+            name: "Public API",
+            sort_order: 1,
+          }),
+          enabled: 0,
+        } as ComponentRow,
+      ],
+    });
+    listLatestProbeResults.mockResolvedValue([]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    const kvPut = vi.fn();
+
+    const snapshot = await recomputePublicStatus(
+      {} as D1Database,
+      { put: kvPut } as unknown as KVNamespace,
+      "2026-04-28T00:00:00.000Z",
+    );
+
+    expect(
+      snapshot.services[0]?.components.some(
+        (component) => component.slug === "public-api",
+      ),
+    ).toBe(false);
   });
 });
