@@ -312,6 +312,27 @@ describe("worker asset shell", () => {
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("status shell");
   });
+
+  it("serves the admin shell at /admin", async () => {
+    const env = {
+      ...createEnv(),
+      ASSETS: ({
+        fetch: async (request: Request) =>
+          new Response(new URL(request.url).pathname, {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+          }),
+      } as Fetcher),
+    };
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/admin"),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.text()).resolves.toBe("/admin/index.html");
+  });
 });
 
 describe("public status route", () => {

@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FlareStatus Admin</title>
+    <link rel="stylesheet" href="/admin/app.css" />
+  </head>
+  <body>
+    <main class="admin-page">
+      <header class="admin-header">
+        <div>
+          <p class="eyebrow">FlareStatus Admin</p>
+          <h1>Catalog And Public Operations</h1>
+        </div>
+        <div class="header-tools">
+          <label class="token-field">
+            <span>API Token</span>
+            <input id="admin-token" type="password" placeholder="Set session token" />
+          </label>
+          <button id="connect-token" type="button">Connect</button>
+        </div>
+      </header>
+
+      <section class="preview-strip">
+        <div class="preview-card">
+          <p class="preview-label">Public Summary</p>
+          <strong id="preview-summary">Loading...</strong>
+        </div>
+        <div class="preview-card">
+          <p class="preview-label">Selected Service</p>
+          <strong id="preview-service">No service selected</strong>
+        </div>
+        <div class="preview-card">
+          <p class="preview-label">Announcements</p>
+          <strong id="preview-announcements">Loading...</strong>
+        </div>
+      </section>
+
+      <section id="admin-status" class="admin-status" aria-live="polite">
+        Enter an admin token to load the editable catalog.
+      </section>
+
+      <section class="workspace">
+        <aside class="panel sidebar">
+          <div class="panel-header">
+            <h2>Services</h2>
+            <button id="new-service" type="button">New</button>
+          </div>
+          <input id="service-search" type="search" placeholder="Search services" />
+          <div id="service-list" class="service-list"></div>
+        </aside>
+
+        <section class="panel editor">
+          <div class="panel-header">
+            <h2>Service Details</h2>
+            <button id="save-service" type="button">Save Service</button>
+          </div>
+          <form id="service-form" class="stacked-form">
+            <label>
+              <span>Name</span>
+              <input id="service-name" name="name" type="text" />
+            </label>
+            <label>
+              <span>Slug</span>
+              <input id="service-slug" name="slug" type="text" />
+            </label>
+            <label>
+              <span>Description</span>
+              <textarea id="service-description" name="description" rows="3"></textarea>
+            </label>
+            <div class="inline-fields">
+              <label>
+                <span>Sort Order</span>
+                <input id="service-sort-order" name="sortOrder" type="number" />
+              </label>
+              <label class="checkbox-field">
+                <input id="service-enabled" name="enabled" type="checkbox" />
+                <span>Enabled</span>
+              </label>
+            </div>
+          </form>
+
+          <div class="panel-header section-header">
+            <h2>Components</h2>
+            <button id="new-component" type="button">New</button>
+          </div>
+          <div id="component-list" class="component-list"></div>
+        </section>
+
+        <aside class="panel actions">
+          <section class="action-card">
+            <div class="panel-header">
+              <h2>Create Override</h2>
+              <button id="submit-override" type="button">Publish</button>
+            </div>
+            <form id="override-form" class="stacked-form">
+              <label>
+                <span>Target Type</span>
+                <select id="override-target-type" name="targetType">
+                  <option value="service">Service</option>
+                  <option value="component">Component</option>
+                </select>
+              </label>
+              <label>
+                <span>Target Slug</span>
+                <input id="override-target-slug" name="targetSlug" type="text" />
+              </label>
+              <label>
+                <span>Status</span>
+                <select id="override-status" name="overrideStatus">
+                  <option value="operational">Operational</option>
+                  <option value="degraded">Degraded</option>
+                  <option value="partial_outage">Partial outage</option>
+                  <option value="major_outage">Major outage</option>
+                </select>
+              </label>
+              <label>
+                <span>Message</span>
+                <textarea id="override-message" name="message" rows="3"></textarea>
+              </label>
+            </form>
+          </section>
+
+          <section class="action-card">
+            <div class="panel-header">
+              <h2>Create Announcement</h2>
+              <button id="submit-announcement" type="button">Publish</button>
+            </div>
+            <form id="announcement-form" class="stacked-form">
+              <label>
+                <span>Title</span>
+                <input id="announcement-title" name="title" type="text" />
+              </label>
+              <label>
+                <span>Body</span>
+                <textarea id="announcement-body" name="body" rows="4"></textarea>
+              </label>
+              <label>
+                <span>Status Level</span>
+                <select id="announcement-status" name="statusLevel">
+                  <option value="operational">Operational</option>
+                  <option value="degraded">Degraded</option>
+                  <option value="partial_outage">Partial outage</option>
+                  <option value="major_outage">Major outage</option>
+                </select>
+              </label>
+            </form>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <script type="module" src="/admin/app.js"></script>
+  </body>
+</html>
