@@ -2,8 +2,8 @@ import {
   listActiveAnnouncements,
   listActiveOverrides,
   listLatestProbeResults,
+  persistStatusUpdatesInTransaction,
   listServicesWithComponents,
-  persistStatusUpdates,
 } from "./db";
 import { buildPublicSnapshot } from "./snapshot";
 import {
@@ -11,12 +11,27 @@ import {
   coalesceDisplayStatus,
   type PublicStatus,
 } from "./status";
+import {
+  CURRENT_PUBLIC_SNAPSHOT_KEY,
+  upsertPublicSnapshotInTransaction,
+} from "./snapshots";
+import type { AppDatabase } from "./env";
+import { withTransaction, type SqlConnection } from "./sql";
 import type {
   ComponentStatusUpdateRow,
   OverrideRow,
+  PublicSnapshot,
   ProbeResultRow,
   ServiceStatusUpdateRow,
 } from "../types";
+
+function getSqlConnection(db: AppDatabase): SqlConnection {
+  if ("unsafe" in db && "begin" in db) {
+    return db;
+  }
+
+  throw new TypeError("PostgreSQL SqlConnection is required");
+}
 
 function pickLatestOverride(
   overrides: OverrideRow[],
@@ -33,23 +48,16 @@ function pickLatestOverride(
   return overrideMap;
 }
 
-function compareProbeResults(a: ProbeResultRow, b: ProbeResultRow) {
-  if (a.checked_at !== b.checked_at) {
-    return a.checked_at > b.checked_at ? 1 : -1;
-  }
-
-  return 0;
-}
-
 function pickLatestProbeResult(
   probeResults: ProbeResultRow[],
 ): Map<string, ProbeResultRow> {
   const probeResultByComponentId = new Map<string, ProbeResultRow>();
 
   for (const probeResult of probeResults) {
-    const current = probeResultByComponentId.get(probeResult.component_id);
-
-    if (!current || compareProbeResults(probeResult, current) > 0) {
+    // The DAL is responsible for returning rows in latest-first order.
+    // Preserve the first row we see for each component so SQL and in-memory
+    // tie-break behavior stay aligned.
+    if (!probeResultByComponentId.has(probeResult.component_id)) {
       probeResultByComponentId.set(probeResult.component_id, probeResult);
     }
   }
@@ -58,8 +66,7 @@ function pickLatestProbeResult(
 }
 
 export async function recomputePublicStatus(
-  db: D1Database,
-  kv: KVNamespace,
+  db: AppDatabase,
   nowIso: string,
 ) {
   const [
@@ -131,15 +138,6 @@ export async function recomputePublicStatus(
     };
   });
 
-  await persistStatusUpdates(
-    db,
-    {
-      componentRows: componentStatusRows,
-      serviceRows: serviceStatusRows,
-    },
-    nowIso,
-  );
-
   const serviceStatusById = new Map(
     serviceStatusRows.map((row) => [row.id, row.status] as const),
   );
@@ -168,7 +166,23 @@ export async function recomputePublicStatus(
     availability: [],
   });
 
-  await kv.put("public:current", JSON.stringify(snapshot));
+  await withTransaction(getSqlConnection(db), async (tx) => {
+    await persistStatusUpdatesInTransaction(
+      tx,
+      {
+        componentRows: componentStatusRows,
+        serviceRows: serviceStatusRows,
+      },
+      nowIso,
+    );
+
+    await upsertPublicSnapshotInTransaction(
+      tx,
+      CURRENT_PUBLIC_SNAPSHOT_KEY,
+      snapshot,
+      nowIso,
+    );
+  });
 
   return snapshot;
 }

@@ -2,11 +2,10 @@
   "name": "probe",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.0.0",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
-    "test": "vitest run",
+    "build": "bun build ./src/index.ts --outdir dist --target bun",
+    "start": "bun run src/index.ts",
+    "test": "bun vitest run",
     "vitest": "vitest"
   },
   "dependencies": {

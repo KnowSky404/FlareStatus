@@ -1,0 +1,19 @@
+services:
+  probe:
+    build:
+      context: .
+      dockerfile: probe/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_started
+    environment:
+      PROBE_COMPONENT_SLUG: ${PROBE_COMPONENT_SLUG:-flarestatus-public-api}
+      PROBE_REPORT_ENDPOINT: ${PROBE_REPORT_ENDPOINT:-http://app:3000/api/probe/report}
+      PROBE_REPORT_TOKEN: ${PROBE_REPORT_TOKEN:-change-me-probe-token}
+      PROBE_INTERVAL_MS: ${PROBE_INTERVAL_MS:-30000}
+      PROBE_RUN_ONCE: ${PROBE_RUN_ONCE:-false}
+      PROBE_CHECK_TYPE: ${PROBE_CHECK_TYPE:-http}
+      PROBE_HTTP_URL: ${PROBE_HTTP_URL:-http://app:3000/api/public/status}
+      PROBE_HTTP_TIMEOUT_MS: ${PROBE_HTTP_TIMEOUT_MS:-3000}
+      PROBE_HTTP_EXPECTED_STATUS: ${PROBE_HTTP_EXPECTED_STATUS:-200}

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadProbeConfig } from "../config.js";
-import { runProbeLoop, runSingleProbe } from "../index.js";
+import { runProbe, runProbeLoop, runSingleProbe } from "../index.js";
 
 vi.mock("../client.js", () => ({
   sendProbeReport: vi.fn(),
@@ -37,6 +37,31 @@ describe("loadProbeConfig", () => {
       timeoutMs: 3000,
       expectedStatus: [200],
     });
+  });
+
+  it("runs a single probe from env-driven config without dist output assumptions", async () => {
+    runHttpCheckMock.mockResolvedValue({
+      status: "operational",
+      latencyMs: 45,
+      checkedAt: "2026-04-29T08:00:00.000Z",
+      summary: "200",
+    });
+
+    const result = await runProbe({
+      PROBE_COMPONENT_SLUG: "api",
+      PROBE_REPORT_ENDPOINT: "https://flarestatus.test/api/probe/report",
+      PROBE_REPORT_TOKEN: "token",
+      PROBE_HTTP_URL: "https://service.test/health",
+      PROBE_RUN_ONCE: "true",
+    });
+
+    expect(result).toEqual({
+      status: "operational",
+      latencyMs: 45,
+      checkedAt: "2026-04-29T08:00:00.000Z",
+      summary: "200",
+    });
+    expect(sendProbeReportMock).toHaveBeenCalledTimes(1);
   });
 });
 

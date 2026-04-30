@@ -1,14 +1,14 @@
-FROM node:22-alpine
+FROM oven/bun:1.3.13-alpine
 
 WORKDIR /app
 
-COPY package.json tsconfig.json ./
+COPY bun.lock package.json ./
+COPY probe/package.json ./probe/package.json
 
-RUN corepack enable
-RUN pnpm install --no-frozen-lockfile
+RUN bun install --frozen-lockfile
 
-COPY src ./src
+COPY probe ./probe
 
-RUN pnpm run build
+WORKDIR /app/probe
 
-CMD ["node", "dist/index.js"]
+CMD ["bun", "run", "src/index.ts"]

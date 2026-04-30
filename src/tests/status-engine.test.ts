@@ -1,27 +1,57 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AppDatabase } from "../lib/env";
+import type { SqlConnection, SqlValue } from "../lib/sql";
 import type {
   AnnouncementRow,
   ComponentRow,
   OverrideRow,
+  PublicSnapshot,
   ProbeResultRow,
   ServiceRow,
 } from "../types";
 import { recomputePublicStatus } from "../lib/status-engine";
 import * as dbModule from "../lib/db";
+import { normalizeSql, RecordingSqlConnection } from "./helpers/postgres";
+import {
+  CURRENT_PUBLIC_SNAPSHOT_KEY,
+  loadPublicSnapshot,
+} from "../lib/snapshots";
 
-vi.mock("../lib/db", () => ({
-  listServicesWithComponents: vi.fn(),
-  listLatestProbeResults: vi.fn(),
-  listActiveOverrides: vi.fn(),
-  listActiveAnnouncements: vi.fn(),
-  persistStatusUpdates: vi.fn(),
-}));
+vi.mock("../lib/db", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/db")>();
+
+  return {
+    ...actual,
+    listServicesWithComponents: vi.fn(),
+    listLatestProbeResults: vi.fn(),
+    listActiveOverrides: vi.fn(),
+    listActiveAnnouncements: vi.fn(),
+  };
+});
 
 const listServicesWithComponents = vi.mocked(dbModule.listServicesWithComponents);
 const listLatestProbeResults = vi.mocked(dbModule.listLatestProbeResults);
 const listActiveOverrides = vi.mocked(dbModule.listActiveOverrides);
 const listActiveAnnouncements = vi.mocked(dbModule.listActiveAnnouncements);
-const persistStatusUpdates = vi.mocked(dbModule.persistStatusUpdates);
+const UPSERT_PUBLIC_SNAPSHOT_SQL = `INSERT INTO public_snapshots (key, payload, generated_at, updated_at)
+     VALUES ($1, $2::jsonb, $3, $3)
+     ON CONFLICT (key)
+     DO UPDATE SET payload = EXCLUDED.payload,
+                   generated_at = EXCLUDED.generated_at,
+                   updated_at = EXCLUDED.updated_at`;
+
+const LOAD_PUBLIC_SNAPSHOT_SQL = `SELECT payload::text AS payload
+     FROM public_snapshots
+     WHERE key = $1
+     LIMIT 1`;
+
+const UPDATE_COMPONENT_STATUS_SQL = `UPDATE components
+            SET observed_status = $1, display_status = $2, updated_at = $3
+            WHERE id = $4`;
+
+const UPDATE_SERVICE_STATUS_SQL = `UPDATE services
+            SET status = $1, updated_at = $2
+            WHERE id = $3`;
 
 function createServiceRow(overrides: Partial<ServiceRow> = {}): ServiceRow {
   return {
@@ -102,11 +132,82 @@ function createAnnouncementRow(
   };
 }
 
+function createDb(): AppDatabase {
+  const snapshots = new Map<string, string>();
+
+  return new RecordingSqlConnection()
+    .when(UPDATE_COMPONENT_STATUS_SQL, () => [])
+    .when(UPDATE_SERVICE_STATUS_SQL, () => [])
+    .when(UPSERT_PUBLIC_SNAPSHOT_SQL, (params) => {
+      const [key, payload] = params as [string, unknown, string];
+      snapshots.set(key, JSON.stringify(payload));
+      return [];
+    })
+    .when(LOAD_PUBLIC_SNAPSHOT_SQL, (params) => {
+      const [key] = params as [string];
+      const payload = snapshots.get(key);
+
+      return payload ? [{ payload }] : [];
+    });
+}
+
+function createTransactionAwareDb() {
+  const snapshots = new Map<string, string>();
+  const transactionLog: string[] = [];
+  let beginCount = 0;
+
+  const connection: SqlConnection = {
+    async unsafe<T = unknown>(query: string, params?: readonly SqlValue[]) {
+      const normalizedQuery = normalizeSql(query);
+      transactionLog.push(normalizedQuery);
+
+      if (normalizedQuery === normalizeSql(UPSERT_PUBLIC_SNAPSHOT_SQL)) {
+        const [key, payload] = params as [string, unknown, string];
+        snapshots.set(key, JSON.stringify(payload));
+        return [] as T;
+      }
+
+      if (normalizedQuery === normalizeSql(LOAD_PUBLIC_SNAPSHOT_SQL)) {
+        const [key] = params as [string];
+        const payload = snapshots.get(key);
+        return (payload ? [{ payload }] : []) as T;
+      }
+
+      if (
+        normalizedQuery ===
+          normalizeSql(`UPDATE components
+            SET observed_status = $1, display_status = $2, updated_at = $3
+            WHERE id = $4`) ||
+        normalizedQuery ===
+          normalizeSql(`UPDATE services
+            SET status = $1, updated_at = $2
+            WHERE id = $3`)
+      ) {
+        return [] as T;
+      }
+
+      throw new Error(`Unexpected SQL: ${query}`);
+    },
+    async begin<T>(callback: (tx: SqlConnection) => Promise<T>) {
+      beginCount += 1;
+      return callback(connection);
+    },
+  };
+
+  return {
+    db: connection as AppDatabase,
+    getBeginCount() {
+      return beginCount;
+    },
+    getTransactionLog() {
+      return transactionLog;
+    },
+  };
+}
+
 describe("recomputePublicStatus", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-
-    persistStatusUpdates.mockResolvedValue(undefined);
     listActiveAnnouncements.mockResolvedValue([]);
   });
 
@@ -122,30 +223,32 @@ describe("recomputePublicStatus", () => {
       createOverrideRow({ override_status: "major_outage" }),
     ]);
 
-    const kvPut = vi.fn();
+    const db = createDb();
 
-    await recomputePublicStatus(
-      {} as D1Database,
-      { put: kvPut } as unknown as KVNamespace,
-      "2026-04-27T10:00:00.000Z",
+    await recomputePublicStatus(db, "2026-04-27T10:00:00.000Z");
+
+    expect((db as RecordingSqlConnection).log).toEqual(
+      expect.arrayContaining([
+        {
+          query: UPDATE_COMPONENT_STATUS_SQL,
+          params: [
+            "degraded",
+            "major_outage",
+            "2026-04-27T10:00:00.000Z",
+            "cmp_1",
+          ],
+        },
+        {
+          query: UPDATE_SERVICE_STATUS_SQL,
+          params: ["major_outage", "2026-04-27T10:00:00.000Z", "svc_1"],
+        },
+      ]),
     );
 
-    expect(persistStatusUpdates).toHaveBeenCalledWith(
-      expect.anything(),
-      {
-        componentRows: [
-          {
-            id: "cmp_1",
-            observedStatus: "degraded",
-            displayStatus: "major_outage",
-          },
-        ],
-        serviceRows: [{ id: "svc_1", status: "major_outage" }],
-      },
-      "2026-04-27T10:00:00.000Z",
-    );
-
-    const snapshot = JSON.parse(kvPut.mock.calls[0][1] as string);
+    const snapshot = (await loadPublicSnapshot(
+      db,
+      CURRENT_PUBLIC_SNAPSHOT_KEY,
+    )) as PublicSnapshot;
 
     expect(snapshot.services[0]?.components[0]?.displayStatus).toBe(
       "major_outage",
@@ -162,30 +265,32 @@ describe("recomputePublicStatus", () => {
     ]);
     listActiveOverrides.mockResolvedValue([]);
 
-    const kvPut = vi.fn();
+    const db = createDb();
 
-    await recomputePublicStatus(
-      {} as D1Database,
-      { put: kvPut } as unknown as KVNamespace,
-      "2026-04-27T10:00:00.000Z",
+    await recomputePublicStatus(db, "2026-04-27T10:00:00.000Z");
+
+    expect((db as RecordingSqlConnection).log).toEqual(
+      expect.arrayContaining([
+        {
+          query: UPDATE_COMPONENT_STATUS_SQL,
+          params: [
+            "partial_outage",
+            "partial_outage",
+            "2026-04-27T10:00:00.000Z",
+            "cmp_1",
+          ],
+        },
+        {
+          query: UPDATE_SERVICE_STATUS_SQL,
+          params: ["partial_outage", "2026-04-27T10:00:00.000Z", "svc_1"],
+        },
+      ]),
     );
 
-    expect(persistStatusUpdates).toHaveBeenCalledWith(
-      expect.anything(),
-      {
-        componentRows: [
-          {
-            id: "cmp_1",
-            observedStatus: "partial_outage",
-            displayStatus: "partial_outage",
-          },
-        ],
-        serviceRows: [{ id: "svc_1", status: "partial_outage" }],
-      },
-      "2026-04-27T10:00:00.000Z",
-    );
-
-    const snapshot = JSON.parse(kvPut.mock.calls[0][1] as string);
+    const snapshot = (await loadPublicSnapshot(
+      db,
+      CURRENT_PUBLIC_SNAPSHOT_KEY,
+    )) as PublicSnapshot;
 
     expect(snapshot.services[0]?.status).toBe("partial_outage");
   });
@@ -230,15 +335,14 @@ describe("recomputePublicStatus", () => {
     listActiveOverrides.mockResolvedValue([]);
     listActiveAnnouncements.mockResolvedValue([createAnnouncementRow()]);
 
-    const kvPut = vi.fn();
+    const db = createDb();
 
-    await recomputePublicStatus(
-      {} as D1Database,
-      { put: kvPut } as unknown as KVNamespace,
-      "2026-04-27T10:00:00.000Z",
-    );
+    await recomputePublicStatus(db, "2026-04-27T10:00:00.000Z");
 
-    const snapshot = JSON.parse(kvPut.mock.calls[0][1] as string);
+    const snapshot = (await loadPublicSnapshot(
+      db,
+      CURRENT_PUBLIC_SNAPSHOT_KEY,
+    )) as PublicSnapshot;
 
     expect(snapshot.summary.status).toBe("major_outage");
   });
@@ -262,33 +366,83 @@ describe("recomputePublicStatus", () => {
     ]);
     listActiveOverrides.mockResolvedValue([]);
 
-    const kvPut = vi.fn();
+    const db = createDb();
 
-    await recomputePublicStatus(
-      {} as D1Database,
-      { put: kvPut } as unknown as KVNamespace,
-      "2026-04-27T10:00:00.000Z",
+    await recomputePublicStatus(db, "2026-04-27T10:00:00.000Z");
+
+    expect((db as RecordingSqlConnection).log).toEqual(
+      expect.arrayContaining([
+        {
+          query: UPDATE_COMPONENT_STATUS_SQL,
+          params: [
+            "operational",
+            "operational",
+            "2026-04-27T10:00:00.000Z",
+            "cmp_1",
+          ],
+        },
+      ]),
     );
 
-    expect(persistStatusUpdates).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({
-        componentRows: [
-          {
-            id: "cmp_1",
-            observedStatus: "operational",
-            displayStatus: "operational",
-          },
-        ],
-      }),
-      "2026-04-27T10:00:00.000Z",
-    );
-
-    const snapshot = JSON.parse(kvPut.mock.calls[0][1] as string);
+    const snapshot = (await loadPublicSnapshot(
+      db,
+      CURRENT_PUBLIC_SNAPSHOT_KEY,
+    )) as PublicSnapshot;
 
     expect(snapshot.services[0]?.components[0]?.displayStatus).toBe(
       "operational",
     );
+  });
+
+  it("treats probe rows as pre-ranked and keeps the first row for a component", async () => {
+    listServicesWithComponents.mockResolvedValue({
+      services: [createServiceRow()],
+      components: [createComponentRow()],
+    });
+    listLatestProbeResults.mockResolvedValue([
+      createProbeResultRow({
+        id: "probe_first",
+        status: "operational",
+        checked_at: "2026-04-27T10:05:00.000Z",
+      }),
+      createProbeResultRow({
+        id: "probe_second",
+        status: "major_outage",
+        checked_at: "2026-04-27T10:00:00.000Z",
+      }),
+    ]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    const snapshot = await recomputePublicStatus(
+      createDb(),
+      "2026-04-27T10:10:00.000Z",
+    );
+
+    expect((snapshot as PublicSnapshot).services[0]?.components[0]?.displayStatus).toBe(
+      "operational",
+    );
+  });
+
+  it("persists status updates and the snapshot inside one transaction", async () => {
+    listServicesWithComponents.mockResolvedValue({
+      services: [createServiceRow()],
+      components: [createComponentRow()],
+    });
+    listLatestProbeResults.mockResolvedValue([
+      createProbeResultRow({ status: "degraded" }),
+    ]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    const db = createTransactionAwareDb();
+
+    await recomputePublicStatus(db.db, "2026-04-27T10:00:00.000Z");
+
+    expect(db.getBeginCount()).toBe(1);
+    expect(db.getTransactionLog()).toEqual([
+      normalizeSql(UPDATE_COMPONENT_STATUS_SQL),
+      normalizeSql(UPDATE_SERVICE_STATUS_SQL),
+      normalizeSql(UPSERT_PUBLIC_SNAPSHOT_SQL),
+    ]);
   });
 
   it("ignores disabled components when building the public snapshot", async () => {
@@ -310,11 +464,8 @@ describe("recomputePublicStatus", () => {
     listLatestProbeResults.mockResolvedValue([]);
     listActiveOverrides.mockResolvedValue([]);
 
-    const kvPut = vi.fn();
-
     const snapshot = await recomputePublicStatus(
-      {} as D1Database,
-      { put: kvPut } as unknown as KVNamespace,
+      createDb(),
       "2026-04-28T00:00:00.000Z",
     );
 
@@ -350,8 +501,7 @@ describe("recomputePublicStatus", () => {
     listActiveOverrides.mockResolvedValue([]);
 
     const snapshot = await recomputePublicStatus(
-      {} as D1Database,
-      { put: vi.fn() } as unknown as KVNamespace,
+      createDb(),
       "2026-04-28T00:00:00.000Z",
     );
 
@@ -380,13 +530,57 @@ describe("recomputePublicStatus", () => {
     listActiveOverrides.mockResolvedValue([]);
 
     const snapshot = await recomputePublicStatus(
-      {} as D1Database,
-      { put: vi.fn() } as unknown as KVNamespace,
+      createDb(),
       "2026-04-28T00:00:00.000Z",
     );
 
     expect(snapshot.services.find((service) => service.slug === "api")?.status).toBe(
       "operational",
     );
+  });
+
+  it("upserts the current public snapshot into postgres", async () => {
+    const db = createDb();
+    const nowIso = "2026-04-29T10:00:00.000Z";
+
+    listServicesWithComponents.mockResolvedValue({
+      services: [createServiceRow()],
+      components: [createComponentRow()],
+    });
+    listLatestProbeResults.mockResolvedValue([createProbeResultRow()]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    await recomputePublicStatus(db, nowIso);
+
+    await expect(
+      loadPublicSnapshot(db, CURRENT_PUBLIC_SNAPSHOT_KEY),
+    ).resolves.toMatchObject({
+      generatedAt: nowIso,
+      summary: { status: "operational" },
+    });
+  });
+
+  it("binds the public snapshot as a jsonb object instead of a json string", async () => {
+    const db = createDb();
+    const nowIso = "2026-04-29T10:00:00.000Z";
+
+    listServicesWithComponents.mockResolvedValue({
+      services: [createServiceRow()],
+      components: [createComponentRow()],
+    });
+    listLatestProbeResults.mockResolvedValue([createProbeResultRow()]);
+    listActiveOverrides.mockResolvedValue([]);
+
+    await recomputePublicStatus(db, nowIso);
+
+    const upsert = (db as RecordingSqlConnection).log.find(
+      (entry) =>
+        normalizeSql(entry.query) === normalizeSql(UPSERT_PUBLIC_SNAPSHOT_SQL),
+    );
+
+    expect(upsert?.params?.[1]).toMatchObject({
+      generatedAt: nowIso,
+      summary: { status: "operational" },
+    });
   });
 });

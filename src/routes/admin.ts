@@ -8,8 +8,14 @@ import {
   updateComponent,
   updateService,
 } from "../lib/db";
-import type { Env } from "../lib/env";
+import {
+  getAdminApiToken,
+  getAppDatabase,
+  type AppContext,
+  type Env,
+} from "../lib/env";
 import { recomputePublicStatus } from "../lib/status-engine";
+import type { SqlConnection } from "../lib/sql";
 import type { PublicStatus } from "../types";
 
 interface AdminOverridePayload {
@@ -79,6 +85,10 @@ interface AdminAuthResult {
 interface AdminPayloadResult extends AdminAuthResult {
   payload?: unknown;
 }
+
+type AdminDatabaseResult =
+  | { ok: true; db: SqlConnection }
+  | { ok: false; response: Response };
 
 const ADMIN_TARGET_TYPES = new Set(["service", "component"]);
 const ADMIN_OVERRIDE_STATUSES = new Set([
@@ -333,13 +343,45 @@ function isComponentSlugConflictError(error: unknown) {
   );
 }
 
+function hasValidAdminAuthorization(auth: string | null, token: string): boolean {
+  if (token.length === 0 || auth === null) {
+    return false;
+  }
+
+  const match = /^bearer\s+(.+)$/i.exec(auth);
+
+  return match?.[1] === token;
+}
+
+function requireAdminDatabase(env: Env): AdminDatabaseResult {
+  let db: ReturnType<typeof getAppDatabase>;
+
+  try {
+    db = getAppDatabase(env);
+  } catch {
+    return {
+      ok: false,
+      response: new Response("admin database unavailable", { status: 503 }),
+    };
+  }
+
+  if (!("unsafe" in db && "begin" in db)) {
+    return {
+      ok: false,
+      response: new Response("admin database unavailable", { status: 503 }),
+    };
+  }
+
+  return { ok: true, db };
+}
+
 function requireAdminAuthorization(
   request: Request,
   env: Env,
 ): AdminAuthResult {
   const auth = request.headers.get("authorization");
 
-  if (auth !== `Bearer ${env.ADMIN_API_TOKEN}`) {
+  if (!hasValidAdminAuthorization(auth, getAdminApiToken(env))) {
     return {
       response: new Response("unauthorized", { status: 401 }),
     };
@@ -370,8 +412,8 @@ async function parseAdminPayload(
 }
 
 function schedulePublicStatusRecompute(
-  ctx: ExecutionContext,
-  env: Env,
+  ctx: AppContext,
+  db: ReturnType<typeof getAppDatabase>,
   nowIso: string,
   source:
     | "admin override"
@@ -382,8 +424,8 @@ function schedulePublicStatusRecompute(
     | "admin component update"
     | "admin catalog reorder",
 ) {
-  ctx.waitUntil(
-    recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso).catch((error) => {
+  ctx.defer(
+    recomputePublicStatus(db, nowIso).catch((error) => {
       console.error(
         `failed to recompute public status after ${source} insert`,
         error,
@@ -395,7 +437,7 @@ function schedulePublicStatusRecompute(
 export async function handleAdminOverride(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
 
@@ -419,8 +461,15 @@ export async function handleAdminOverride(
   }
 
   const nowIso = new Date().toISOString();
+  const dbResult = requireAdminDatabase(env);
 
-  const result = await createOverride(env.DB, {
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { db } = dbResult;
+
+  const result = await createOverride(db, {
     targetType: payload.targetType,
     targetSlug: payload.targetSlug,
     overrideStatus: payload.overrideStatus,
@@ -434,7 +483,7 @@ export async function handleAdminOverride(
     return new Response("target not found", { status: 404 });
   }
 
-  schedulePublicStatusRecompute(ctx, env, nowIso, "admin override");
+  schedulePublicStatusRecompute(ctx, db, nowIso, "admin override");
 
   return Response.json({ created: true }, { status: 201 });
 }
@@ -442,7 +491,7 @@ export async function handleAdminOverride(
 export async function handleAdminAnnouncement(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
 
@@ -466,8 +515,15 @@ export async function handleAdminAnnouncement(
   }
 
   const nowIso = new Date().toISOString();
+  const dbResult = requireAdminDatabase(env);
 
-  await createAnnouncement(env.DB, {
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { db } = dbResult;
+
+  await createAnnouncement(db, {
     title: payload.title,
     body: payload.body,
     statusLevel: payload.statusLevel,
@@ -476,7 +532,7 @@ export async function handleAdminAnnouncement(
     createdAt: nowIso,
   });
 
-  schedulePublicStatusRecompute(ctx, env, nowIso, "admin announcement");
+  schedulePublicStatusRecompute(ctx, db, nowIso, "admin announcement");
 
   return Response.json({ created: true }, { status: 201 });
 }
@@ -491,7 +547,13 @@ export async function handleAdminCatalog(
     return authResult.response;
   }
 
-  const { services, components } = await listServicesWithComponents(env.DB);
+  const dbResult = requireAdminDatabase(env);
+
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { services, components } = await listServicesWithComponents(dbResult.db);
 
   return Response.json({
     services: services.map((service) => ({
@@ -524,7 +586,7 @@ export async function handleAdminCatalog(
 export async function handleAdminCreateService(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
 
@@ -539,9 +601,16 @@ export async function handleAdminCreateService(
   }
 
   const nowIso = new Date().toISOString();
+  const dbResult = requireAdminDatabase(env);
+
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { db } = dbResult;
 
   try {
-    await createService(env.DB, {
+    await createService(db, {
       slug: payload.slug,
       name: payload.name,
       description: payload.description ?? "",
@@ -558,7 +627,7 @@ export async function handleAdminCreateService(
     throw error;
   }
 
-  schedulePublicStatusRecompute(ctx, env, nowIso, "admin service create");
+  schedulePublicStatusRecompute(ctx, db, nowIso, "admin service create");
 
   return Response.json({ created: true }, { status: 201 });
 }
@@ -566,7 +635,7 @@ export async function handleAdminCreateService(
 export async function handleAdminUpdateService(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
   currentSlug: string,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
@@ -582,10 +651,17 @@ export async function handleAdminUpdateService(
   }
 
   const nowIso = new Date().toISOString();
+  const dbResult = requireAdminDatabase(env);
+
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { db } = dbResult;
   let result: { changes: number };
 
   try {
-    result = await updateService(env.DB, {
+    result = await updateService(db, {
       currentSlug,
       slug: payload.slug,
       name: payload.name,
@@ -606,7 +682,7 @@ export async function handleAdminUpdateService(
     return new Response("service not found", { status: 404 });
   }
 
-  schedulePublicStatusRecompute(ctx, env, nowIso, "admin service update");
+  schedulePublicStatusRecompute(ctx, db, nowIso, "admin service update");
 
   return Response.json({ updated: true });
 }
@@ -614,7 +690,7 @@ export async function handleAdminUpdateService(
 export async function handleAdminCreateComponent(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
 
@@ -629,9 +705,16 @@ export async function handleAdminCreateComponent(
   }
 
   const nowIso = new Date().toISOString();
+  const dbResult = requireAdminDatabase(env);
+
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { db } = dbResult;
 
   try {
-    const result = await createComponent(env.DB, {
+    const result = await createComponent(db, {
       serviceSlug: payload.serviceSlug,
       slug: payload.slug,
       name: payload.name,
@@ -654,7 +737,7 @@ export async function handleAdminCreateComponent(
     throw error;
   }
 
-  schedulePublicStatusRecompute(ctx, env, nowIso, "admin component create");
+  schedulePublicStatusRecompute(ctx, db, nowIso, "admin component create");
 
   return Response.json({ created: true }, { status: 201 });
 }
@@ -662,7 +745,7 @@ export async function handleAdminCreateComponent(
 export async function handleAdminUpdateComponent(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
   currentSlug: string,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
@@ -678,10 +761,17 @@ export async function handleAdminUpdateComponent(
   }
 
   const nowIso = new Date().toISOString();
+  const dbResult = requireAdminDatabase(env);
+
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { db } = dbResult;
   let result: { changes: number };
 
   try {
-    result = await updateComponent(env.DB, {
+    result = await updateComponent(db, {
       currentSlug,
       slug: payload.slug,
       name: payload.name,
@@ -704,7 +794,7 @@ export async function handleAdminUpdateComponent(
     return new Response("component not found", { status: 404 });
   }
 
-  schedulePublicStatusRecompute(ctx, env, nowIso, "admin component update");
+  schedulePublicStatusRecompute(ctx, db, nowIso, "admin component update");
 
   return Response.json({ updated: true });
 }
@@ -712,7 +802,7 @@ export async function handleAdminUpdateComponent(
 export async function handleAdminReorderCatalog(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
 ): Promise<Response> {
   const parsed = await parseAdminPayload(request, env);
 
@@ -727,14 +817,21 @@ export async function handleAdminReorderCatalog(
   }
 
   const nowIso = new Date().toISOString();
+  const dbResult = requireAdminDatabase(env);
 
-  await reorderCatalog(env.DB, {
+  if (!dbResult.ok) {
+    return dbResult.response;
+  }
+
+  const { db } = dbResult;
+
+  await reorderCatalog(db, {
     serviceSorts: payload.services,
     componentSorts: payload.components,
     updatedAt: nowIso,
   });
 
-  schedulePublicStatusRecompute(ctx, env, nowIso, "admin catalog reorder");
+  schedulePublicStatusRecompute(ctx, db, nowIso, "admin catalog reorder");
 
   return Response.json({ updated: true });
 }

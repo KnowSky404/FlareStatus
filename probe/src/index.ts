@@ -9,6 +9,8 @@ interface ProbeScheduler {
   clearInterval(timer: ReturnType<typeof setInterval>): void;
 }
 
+type ProbeEnv = Record<string, string | undefined>;
+
 const defaultScheduler: ProbeScheduler = {
   setInterval: globalThis.setInterval,
   clearInterval: globalThis.clearInterval,
@@ -57,17 +59,22 @@ export async function runProbeLoop(
   };
 }
 
-export async function runProbe() {
-  const config = loadProbeConfig();
+export async function runProbe(
+  env: ProbeEnv = process.env,
+  scheduler: ProbeScheduler = defaultScheduler,
+) {
+  const config = loadProbeConfig(env);
 
   if (config.runOnce) {
     return runSingleProbe(config);
   }
 
-  return runProbeLoop(config);
+  return runProbeLoop(config, scheduler);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+const isMainModule = Reflect.get(import.meta as object, "main") === true;
+
+if (isMainModule) {
   runProbe().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     console.error(message);

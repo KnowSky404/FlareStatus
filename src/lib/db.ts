@@ -7,6 +7,106 @@ import type {
   ServiceRow,
   ServiceStatusUpdateRow,
 } from "../types";
+import type { AppDatabase } from "./env";
+import { executeSql, withTransaction, type SqlConnection, type SqlValue } from "./sql";
+
+type DatabaseConnection = AppDatabase;
+
+interface IdentifiedRow {
+  id: string;
+}
+
+interface ServiceQueryRow extends Omit<ServiceRow, "enabled"> {
+  enabled: boolean | number;
+}
+
+interface ComponentQueryRow
+  extends Omit<ComponentRow, "enabled" | "is_critical"> {
+  enabled: boolean | number;
+  is_critical: boolean | number;
+}
+
+function getSqlConnection(db: DatabaseConnection): SqlConnection {
+  if ("unsafe" in db && "begin" in db) {
+    return db;
+  }
+
+  throw new TypeError("PostgreSQL SqlConnection is required");
+}
+
+function normalizeFlag(value: boolean | number) {
+  return value === true || value === 1 ? 1 : 0;
+}
+
+function normalizeServiceRow(row: ServiceQueryRow): ServiceRow {
+  return {
+    ...row,
+    enabled: normalizeFlag(row.enabled),
+  };
+}
+
+function normalizeComponentRow(row: ComponentQueryRow): ComponentRow {
+  return {
+    ...row,
+    enabled: normalizeFlag(row.enabled),
+    is_critical: normalizeFlag(row.is_critical),
+  };
+}
+
+async function queryRows<T>(
+  db: DatabaseConnection,
+  query: string,
+  params: readonly SqlValue[] = [],
+): Promise<T[]> {
+  return executeSql<T[]>(getSqlConnection(db), query, params);
+}
+
+async function executeReturningCount(
+  db: DatabaseConnection,
+  query: string,
+  params: readonly SqlValue[],
+): Promise<{ changes: number }> {
+  const rows = await queryRows<IdentifiedRow>(db, query, params);
+
+  return {
+    changes: rows.length,
+  };
+}
+
+function mapSlugConflictError(
+  error: unknown,
+  table: "services" | "components",
+): never {
+  if (
+    error instanceof Error &&
+    error.message.includes("duplicate key value violates unique constraint") &&
+    error.message.includes(`"${table}_slug_key"`)
+  ) {
+    throw new Error(`UNIQUE constraint failed: ${table}.slug`);
+  }
+
+  throw error;
+}
+
+interface SqlStatement {
+  query: string;
+  params: readonly SqlValue[];
+}
+
+async function runStatements(
+  db: DatabaseConnection,
+  statements: readonly SqlStatement[],
+) {
+  if (statements.length === 0) {
+    return;
+  }
+
+  await withTransaction(getSqlConnection(db), async (tx) => {
+    for (const statement of statements) {
+      await executeSql(tx, statement.query, statement.params);
+    }
+  });
+}
 
 export interface CreateOverrideInput {
   targetType: "service" | "component";
@@ -19,17 +119,20 @@ export interface CreateOverrideInput {
 }
 
 export async function createOverride(
-  db: D1Database,
+  db: DatabaseConnection,
   input: CreateOverrideInput,
 ) {
-  const result = await db
-    .prepare(
-      `INSERT INTO overrides (id, target_type, target_id, override_status, message, starts_at, ends_at, created_by, created_at)
-       SELECT ?, ?, id, ?, ?, ?, ?, 'operator', ?
-       FROM ${input.targetType === "service" ? "services" : "components"}
-       WHERE slug = ?`,
-    )
-    .bind(
+  const targetTable =
+    input.targetType === "service" ? "services" : "components";
+
+  return executeReturningCount(
+    db,
+    `INSERT INTO overrides (id, target_type, target_id, override_status, message, starts_at, ends_at, created_by, created_at)
+     SELECT $1, $2, id, $3, $4, $5, $6, 'operator', $7
+     FROM ${targetTable}
+     WHERE slug = $8
+     RETURNING id`,
+    [
       crypto.randomUUID(),
       input.targetType,
       input.overrideStatus,
@@ -38,12 +141,8 @@ export async function createOverride(
       input.endsAt ?? null,
       input.createdAt,
       input.targetSlug,
-    )
-    .run();
-
-  return {
-    changes: result.meta.changes,
-  };
+    ],
+  );
 }
 
 export interface CreateAnnouncementInput {
@@ -56,15 +155,15 @@ export interface CreateAnnouncementInput {
 }
 
 export async function createAnnouncement(
-  db: D1Database,
+  db: DatabaseConnection,
   input: CreateAnnouncementInput,
 ) {
-  const result = await db
-    .prepare(
-      `INSERT INTO announcements (id, title, body, status_level, starts_at, ends_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(
+  return executeReturningCount(
+    db,
+    `INSERT INTO announcements (id, title, body, status_level, starts_at, ends_at, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING id`,
+    [
       crypto.randomUUID(),
       input.title,
       input.body,
@@ -72,12 +171,8 @@ export async function createAnnouncement(
       input.startsAt ?? null,
       input.endsAt ?? null,
       input.createdAt,
-    )
-    .run();
-
-  return {
-    changes: result.meta.changes,
-  };
+    ],
+  );
 }
 
 export interface CreateServiceInput {
@@ -90,27 +185,30 @@ export interface CreateServiceInput {
   updatedAt: string;
 }
 
-export async function createService(db: D1Database, input: CreateServiceInput) {
-  const result = await db
-    .prepare(
+export async function createService(
+  db: DatabaseConnection,
+  input: CreateServiceInput,
+) {
+  try {
+    return await executeReturningCount(
+      db,
       `INSERT INTO services (id, slug, name, description, sort_order, enabled, status, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    )
-    .bind(
-      crypto.randomUUID(),
-      input.slug,
-      input.name,
-      input.description,
-      input.sortOrder,
-      input.enabled ? 1 : 0,
-      input.status,
-      input.updatedAt,
-    )
-    .run();
-
-  return {
-    changes: result.meta.changes,
-  };
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id`,
+      [
+        crypto.randomUUID(),
+        input.slug,
+        input.name,
+        input.description,
+        input.sortOrder,
+        input.enabled,
+        input.status,
+        input.updatedAt,
+      ],
+    );
+  } catch (error) {
+    mapSlugConflictError(error, "services");
+  }
 }
 
 export interface UpdateServiceInput {
@@ -123,32 +221,35 @@ export interface UpdateServiceInput {
   updatedAt: string;
 }
 
-export async function updateService(db: D1Database, input: UpdateServiceInput) {
-  const result = await db
-    .prepare(
+export async function updateService(
+  db: DatabaseConnection,
+  input: UpdateServiceInput,
+) {
+  try {
+    return await executeReturningCount(
+      db,
       `UPDATE services
-       SET slug = COALESCE(?, slug),
-           name = COALESCE(?, name),
-           description = COALESCE(?, description),
-           sort_order = COALESCE(?, sort_order),
-           enabled = COALESCE(?, enabled),
-           updated_at = ?
-       WHERE slug = ?`,
-    )
-    .bind(
-      input.slug ?? null,
-      input.name ?? null,
-      input.description ?? null,
-      input.sortOrder ?? null,
-      input.enabled === undefined ? null : input.enabled ? 1 : 0,
-      input.updatedAt,
-      input.currentSlug,
-    )
-    .run();
-
-  return {
-    changes: result.meta.changes,
-  };
+       SET slug = COALESCE($1, slug),
+           name = COALESCE($2, name),
+           description = COALESCE($3, description),
+           sort_order = COALESCE($4, sort_order),
+           enabled = COALESCE($5, enabled),
+           updated_at = $6
+       WHERE slug = $7
+       RETURNING id`,
+      [
+        input.slug ?? null,
+        input.name ?? null,
+        input.description ?? null,
+        input.sortOrder ?? null,
+        input.enabled ?? null,
+        input.updatedAt,
+        input.currentSlug,
+      ],
+    );
+  } catch (error) {
+    mapSlugConflictError(error, "services");
+  }
 }
 
 export interface CreateComponentInput {
@@ -164,33 +265,33 @@ export interface CreateComponentInput {
 }
 
 export async function createComponent(
-  db: D1Database,
+  db: DatabaseConnection,
   input: CreateComponentInput,
 ) {
-  const result = await db
-    .prepare(
+  try {
+    return await executeReturningCount(
+      db,
       `INSERT INTO components (id, service_id, slug, name, description, probe_type, is_critical, sort_order, enabled, observed_status, display_status, updated_at)
-       SELECT ?, id, ?, ?, ?, ?, ?, ?, ?, 'operational', 'operational', ?
+       SELECT $1, id, $2, $3, $4, $5, $6, $7, $8, 'operational', 'operational', $9
        FROM services
-       WHERE slug = ?`,
-    )
-    .bind(
-      crypto.randomUUID(),
-      input.slug,
-      input.name,
-      input.description,
-      input.probeType,
-      input.isCritical ? 1 : 0,
-      input.sortOrder,
-      input.enabled ? 1 : 0,
-      input.updatedAt,
-      input.serviceSlug,
-    )
-    .run();
-
-  return {
-    changes: result.meta.changes,
-  };
+       WHERE slug = $10
+       RETURNING id`,
+      [
+        crypto.randomUUID(),
+        input.slug,
+        input.name,
+        input.description,
+        input.probeType,
+        input.isCritical,
+        input.sortOrder,
+        input.enabled,
+        input.updatedAt,
+        input.serviceSlug,
+      ],
+    );
+  } catch (error) {
+    mapSlugConflictError(error, "components");
+  }
 }
 
 export interface UpdateComponentInput {
@@ -206,38 +307,38 @@ export interface UpdateComponentInput {
 }
 
 export async function updateComponent(
-  db: D1Database,
+  db: DatabaseConnection,
   input: UpdateComponentInput,
 ) {
-  const result = await db
-    .prepare(
+  try {
+    return await executeReturningCount(
+      db,
       `UPDATE components
-       SET slug = COALESCE(?, slug),
-           name = COALESCE(?, name),
-           description = COALESCE(?, description),
-           probe_type = COALESCE(?, probe_type),
-           is_critical = COALESCE(?, is_critical),
-           sort_order = COALESCE(?, sort_order),
-           enabled = COALESCE(?, enabled),
-           updated_at = ?
-       WHERE slug = ?`,
-    )
-    .bind(
-      input.slug ?? null,
-      input.name ?? null,
-      input.description ?? null,
-      input.probeType ?? null,
-      input.isCritical === undefined ? null : input.isCritical ? 1 : 0,
-      input.sortOrder ?? null,
-      input.enabled === undefined ? null : input.enabled ? 1 : 0,
-      input.updatedAt,
-      input.currentSlug,
-    )
-    .run();
-
-  return {
-    changes: result.meta.changes,
-  };
+       SET slug = COALESCE($1, slug),
+           name = COALESCE($2, name),
+           description = COALESCE($3, description),
+           probe_type = COALESCE($4, probe_type),
+           is_critical = COALESCE($5, is_critical),
+           sort_order = COALESCE($6, sort_order),
+           enabled = COALESCE($7, enabled),
+           updated_at = $8
+       WHERE slug = $9
+       RETURNING id`,
+      [
+        input.slug ?? null,
+        input.name ?? null,
+        input.description ?? null,
+        input.probeType ?? null,
+        input.isCritical ?? null,
+        input.sortOrder ?? null,
+        input.enabled ?? null,
+        input.updatedAt,
+        input.currentSlug,
+      ],
+    );
+  } catch (error) {
+    mapSlugConflictError(error, "components");
+  }
 }
 
 export interface ReorderCatalogInput {
@@ -246,69 +347,74 @@ export interface ReorderCatalogInput {
   updatedAt: string;
 }
 
-export async function reorderCatalog(db: D1Database, input: ReorderCatalogInput) {
-  const statements = [
-    ...input.serviceSorts.map((service) =>
-      db
-        .prepare(
-          `UPDATE services
-           SET sort_order = ?, updated_at = ?
-           WHERE slug = ?`,
-        )
-        .bind(service.sortOrder, input.updatedAt, service.slug),
-    ),
-    ...input.componentSorts.map((component) =>
-      db
-        .prepare(
-          `UPDATE components
-           SET sort_order = ?, updated_at = ?
-           WHERE slug = ?`,
-        )
-        .bind(component.sortOrder, input.updatedAt, component.slug),
-    ),
+export async function reorderCatalog(
+  db: DatabaseConnection,
+  input: ReorderCatalogInput,
+) {
+  const statements: SqlStatement[] = [
+    ...input.serviceSorts.map((service) => ({
+      query: `UPDATE services
+              SET sort_order = $1, updated_at = $2
+              WHERE slug = $3`,
+      params: [service.sortOrder, input.updatedAt, service.slug],
+    })),
+    ...input.componentSorts.map((component) => ({
+      query: `UPDATE components
+              SET sort_order = $1, updated_at = $2
+              WHERE slug = $3`,
+      params: [component.sortOrder, input.updatedAt, component.slug],
+    })),
   ];
 
-  if (statements.length === 0) {
-    return;
-  }
-
-  await db.batch(statements);
+  await runStatements(db, statements);
 }
 
-export async function listServicesWithComponents(db: D1Database) {
-  const services = await db
-    .prepare("SELECT * FROM services ORDER BY sort_order")
-    .all<ServiceRow>();
-  const components = await db
-    .prepare("SELECT * FROM components ORDER BY sort_order")
-    .all<ComponentRow>();
+export async function listServicesWithComponents(db: DatabaseConnection) {
+  const [services, components] = await Promise.all([
+    queryRows<ServiceQueryRow>(
+      db,
+      `SELECT
+         id,
+         slug,
+         name,
+         description,
+         sort_order,
+         enabled,
+         status,
+         updated_at::text AS updated_at
+       FROM services
+       ORDER BY sort_order`,
+    ),
+    queryRows<ComponentQueryRow>(
+      db,
+      `SELECT
+         id,
+         service_id,
+         slug,
+         name,
+         description,
+         probe_type,
+         is_critical,
+         sort_order,
+         enabled,
+         observed_status,
+         display_status,
+         updated_at::text AS updated_at
+       FROM components
+       ORDER BY sort_order`,
+    ),
+  ]);
 
   return {
-    services: services.results,
-    components: components.results,
+    services: services.map(normalizeServiceRow),
+    components: components.map(normalizeComponentRow),
   };
 }
 
-export async function listLatestProbeResults(db: D1Database) {
-  const results = await db
-    .prepare(
-      `WITH ranked_probe_results AS (
-         SELECT
-           id,
-           component_id,
-           probe_source,
-           status,
-           latency_ms,
-           http_code,
-           summary,
-           raw_payload,
-           checked_at,
-           ROW_NUMBER() OVER (
-             PARTITION BY component_id
-             ORDER BY checked_at DESC, rowid DESC
-           ) AS probe_rank
-         FROM probe_results
-       )
+export async function listLatestProbeResults(db: DatabaseConnection) {
+  return queryRows<ProbeResultRow>(
+    db,
+    `WITH ranked_probe_results AS (
        SELECT
          id,
          component_id,
@@ -317,123 +423,141 @@ export async function listLatestProbeResults(db: D1Database) {
          latency_ms,
          http_code,
          summary,
-         raw_payload,
-         checked_at
-       FROM ranked_probe_results
-       WHERE probe_rank = 1
-       ORDER BY component_id`,
-    )
-    .all<ProbeResultRow>();
-
-  return results.results;
+         raw_payload::text AS raw_payload,
+         checked_at::text AS checked_at,
+         ROW_NUMBER() OVER (
+           PARTITION BY component_id
+           ORDER BY checked_at DESC, xmin::text::bigint DESC, ctid DESC
+         ) AS probe_rank
+       FROM probe_results
+     )
+     SELECT
+       id,
+       component_id,
+       probe_source,
+       status,
+       latency_ms,
+       http_code,
+       summary,
+       raw_payload,
+       checked_at
+     FROM ranked_probe_results
+     WHERE probe_rank = 1
+     ORDER BY component_id`,
+  );
 }
 
-export async function listActiveOverrides(db: D1Database, nowIso: string) {
-  const results = await db
-    .prepare(
-      `SELECT *
-       FROM overrides
-       WHERE (starts_at IS NULL OR starts_at <= ?)
-         AND (ends_at IS NULL OR ends_at > ?)
-       ORDER BY created_at DESC`,
-    )
-    .bind(nowIso, nowIso)
-    .all<OverrideRow>();
-
-  return results.results;
+export async function listActiveOverrides(
+  db: DatabaseConnection,
+  nowIso: string,
+) {
+  return queryRows<OverrideRow>(
+    db,
+    `SELECT
+       id,
+       target_type,
+       target_id,
+       override_status,
+       message,
+       starts_at::text AS starts_at,
+       ends_at::text AS ends_at,
+       created_by,
+       created_at::text AS created_at
+     FROM overrides
+     WHERE (starts_at IS NULL OR starts_at <= $1)
+       AND (ends_at IS NULL OR ends_at > $2)
+     ORDER BY created_at DESC, xmin::text::bigint DESC, ctid DESC`,
+    [nowIso, nowIso],
+  );
 }
 
-export async function listActiveAnnouncements(db: D1Database, nowIso: string) {
-  const results = await db
-    .prepare(
-      `SELECT *
-       FROM announcements
-       WHERE (starts_at IS NULL OR starts_at <= ?)
-         AND (ends_at IS NULL OR ends_at > ?)
-       ORDER BY created_at DESC`,
-    )
-    .bind(nowIso, nowIso)
-    .all<AnnouncementRow>();
-
-  return results.results;
+export async function listActiveAnnouncements(
+  db: DatabaseConnection,
+  nowIso: string,
+) {
+  return queryRows<AnnouncementRow>(
+    db,
+    `SELECT
+       id,
+       title,
+       body,
+       status_level,
+       starts_at::text AS starts_at,
+       ends_at::text AS ends_at,
+       created_at::text AS created_at
+     FROM announcements
+     WHERE (starts_at IS NULL OR starts_at <= $1)
+       AND (ends_at IS NULL OR ends_at > $2)
+     ORDER BY created_at DESC`,
+    [nowIso, nowIso],
+  );
 }
 
 function buildComponentStatusStatements(
-  db: D1Database,
   rows: ComponentStatusUpdateRow[],
   nowIso: string,
-) {
-  return rows.map((row) =>
-    db
-      .prepare(
-        `UPDATE components
-         SET observed_status = ?, display_status = ?, updated_at = ?
-         WHERE id = ?`,
-      )
-      .bind(row.observedStatus, row.displayStatus, nowIso, row.id),
-  );
+): SqlStatement[] {
+  return rows.map((row) => ({
+    query: `UPDATE components
+            SET observed_status = $1, display_status = $2, updated_at = $3
+            WHERE id = $4`,
+    params: [row.observedStatus, row.displayStatus, nowIso, row.id],
+  }));
 }
 
 function buildServiceStatusStatements(
-  db: D1Database,
   rows: ServiceStatusUpdateRow[],
   nowIso: string,
-) {
-  return rows.map((row) =>
-    db
-      .prepare(
-        `UPDATE services
-         SET status = ?, updated_at = ?
-         WHERE id = ?`,
-      )
-      .bind(row.status, nowIso, row.id),
-  );
+): SqlStatement[] {
+  return rows.map((row) => ({
+    query: `UPDATE services
+            SET status = $1, updated_at = $2
+            WHERE id = $3`,
+    params: [row.status, nowIso, row.id],
+  }));
 }
 
-export async function updateComponentStatuses(
-  db: D1Database,
-  rows: ComponentStatusUpdateRow[],
-  nowIso: string,
-) {
-  const statements = buildComponentStatusStatements(db, rows, nowIso);
-
-  if (statements.length === 0) {
-    return;
-  }
-
-  await db.batch(statements);
-}
-
-export async function updateServiceStatuses(
-  db: D1Database,
-  rows: ServiceStatusUpdateRow[],
-  nowIso: string,
-) {
-  const statements = buildServiceStatusStatements(db, rows, nowIso);
-
-  if (statements.length === 0) {
-    return;
-  }
-
-  await db.batch(statements);
-}
-
-export async function persistStatusUpdates(
-  db: D1Database,
+export async function persistStatusUpdatesInTransaction(
+  tx: SqlConnection,
   input: {
     componentRows: ComponentStatusUpdateRow[];
     serviceRows: ServiceStatusUpdateRow[];
   },
   nowIso: string,
 ) {
-  const statements = [
-    ...buildComponentStatusStatements(db, input.componentRows, nowIso),
-    ...buildServiceStatusStatements(db, input.serviceRows, nowIso),
-  ];
-
-  if (statements.length === 0) {
-    return;
+  for (const statement of [
+    ...buildComponentStatusStatements(input.componentRows, nowIso),
+    ...buildServiceStatusStatements(input.serviceRows, nowIso),
+  ]) {
+    await executeSql(tx, statement.query, statement.params);
   }
+}
 
-  await db.batch(statements);
+export async function updateComponentStatuses(
+  db: DatabaseConnection,
+  rows: ComponentStatusUpdateRow[],
+  nowIso: string,
+) {
+  await runStatements(db, buildComponentStatusStatements(rows, nowIso));
+}
+
+export async function updateServiceStatuses(
+  db: DatabaseConnection,
+  rows: ServiceStatusUpdateRow[],
+  nowIso: string,
+) {
+  await runStatements(db, buildServiceStatusStatements(rows, nowIso));
+}
+
+export async function persistStatusUpdates(
+  db: DatabaseConnection,
+  input: {
+    componentRows: ComponentStatusUpdateRow[];
+    serviceRows: ServiceStatusUpdateRow[];
+  },
+  nowIso: string,
+) {
+  await withTransaction(getSqlConnection(db), async (tx) => {
+    await persistStatusUpdatesInTransaction(tx, input, nowIso);
+  });
 }

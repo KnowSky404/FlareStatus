@@ -1,50 +1,122 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Env } from "../lib/env";
+import { listActiveOverrides, listLatestProbeResults } from "../lib/db";
+import type { Env, RuntimeContext } from "../lib/env";
 import * as statusEngineModule from "../lib/status-engine";
+import { RecordingSqlConnection, normalizeSql } from "./helpers/postgres";
 import worker from "../worker";
 
 const OVERRIDE_SQL = `INSERT INTO overrides (id, target_type, target_id, override_status, message, starts_at, ends_at, created_by, created_at)
-       SELECT ?, ?, id, ?, ?, ?, ?, 'operator', ?
+       SELECT $1, $2, id, $3, $4, $5, $6, 'operator', $7
        FROM components
-       WHERE slug = ?`;
+       WHERE slug = $8
+       RETURNING id`;
 const ANNOUNCEMENT_SQL = `INSERT INTO announcements (id, title, body, status_level, starts_at, ends_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`;
-const LIST_SERVICES_SQL = "SELECT * FROM services ORDER BY sort_order";
-const LIST_COMPONENTS_SQL = "SELECT * FROM components ORDER BY sort_order";
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`;
+const LIST_SERVICES_SQL = `SELECT
+       id,
+       slug,
+       name,
+       description,
+       sort_order,
+       enabled,
+       status,
+       updated_at::text AS updated_at
+     FROM services
+     ORDER BY sort_order`;
+const LIST_COMPONENTS_SQL = `SELECT
+       id,
+       service_id,
+       slug,
+       name,
+       description,
+       probe_type,
+       is_critical,
+       sort_order,
+       enabled,
+       observed_status,
+       display_status,
+       updated_at::text AS updated_at
+     FROM components
+     ORDER BY sort_order`;
 const INSERT_SERVICE_SQL = `INSERT INTO services (id, slug, name, description, sort_order, enabled, status, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`;
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id`;
 const UPDATE_SERVICE_SQL = `UPDATE services
-       SET slug = COALESCE(?, slug),
-           name = COALESCE(?, name),
-           description = COALESCE(?, description),
-           sort_order = COALESCE(?, sort_order),
-           enabled = COALESCE(?, enabled),
-           updated_at = ?
-       WHERE slug = ?`;
+       SET slug = COALESCE($1, slug),
+           name = COALESCE($2, name),
+           description = COALESCE($3, description),
+           sort_order = COALESCE($4, sort_order),
+           enabled = COALESCE($5, enabled),
+           updated_at = $6
+       WHERE slug = $7
+       RETURNING id`;
 const INSERT_COMPONENT_SQL = `INSERT INTO components (id, service_id, slug, name, description, probe_type, is_critical, sort_order, enabled, observed_status, display_status, updated_at)
-       SELECT ?, id, ?, ?, ?, ?, ?, ?, ?, 'operational', 'operational', ?
+       SELECT $1, id, $2, $3, $4, $5, $6, $7, $8, 'operational', 'operational', $9
        FROM services
-       WHERE slug = ?`;
+       WHERE slug = $10
+       RETURNING id`;
 const UPDATE_COMPONENT_SQL = `UPDATE components
-       SET slug = COALESCE(?, slug),
-           name = COALESCE(?, name),
-           description = COALESCE(?, description),
-           probe_type = COALESCE(?, probe_type),
-           is_critical = COALESCE(?, is_critical),
-           sort_order = COALESCE(?, sort_order),
-           enabled = COALESCE(?, enabled),
-           updated_at = ?
-       WHERE slug = ?`;
+       SET slug = COALESCE($1, slug),
+           name = COALESCE($2, name),
+           description = COALESCE($3, description),
+           probe_type = COALESCE($4, probe_type),
+           is_critical = COALESCE($5, is_critical),
+           sort_order = COALESCE($6, sort_order),
+           enabled = COALESCE($7, enabled),
+           updated_at = $8
+       WHERE slug = $9
+       RETURNING id`;
 const UPDATE_SERVICE_ORDER_SQL = `UPDATE services
-       SET sort_order = ?, updated_at = ?
-       WHERE slug = ?`;
+       SET sort_order = $1, updated_at = $2
+       WHERE slug = $3`;
 const UPDATE_COMPONENT_ORDER_SQL = `UPDATE components
-       SET sort_order = ?, updated_at = ?
-       WHERE slug = ?`;
-
-function normalizeSql(sql: string) {
-  return sql.replace(/\s+/g, " ").trim();
-}
+       SET sort_order = $1, updated_at = $2
+       WHERE slug = $3`;
+const LIST_LATEST_PROBE_RESULTS_SQL = `WITH ranked_probe_results AS (
+       SELECT
+         id,
+         component_id,
+         probe_source,
+         status,
+         latency_ms,
+         http_code,
+         summary,
+         raw_payload::text AS raw_payload,
+         checked_at::text AS checked_at,
+         ROW_NUMBER() OVER (
+           PARTITION BY component_id
+           ORDER BY checked_at DESC, xmin::text::bigint DESC, ctid DESC
+         ) AS probe_rank
+       FROM probe_results
+     )
+     SELECT
+       id,
+       component_id,
+       probe_source,
+       status,
+       latency_ms,
+       http_code,
+       summary,
+       raw_payload,
+       checked_at
+     FROM ranked_probe_results
+     WHERE probe_rank = 1
+     ORDER BY component_id`;
+const LIST_ACTIVE_OVERRIDES_SQL = `SELECT
+       id,
+       target_type,
+       target_id,
+       override_status,
+       message,
+       starts_at::text AS starts_at,
+       ends_at::text AS ends_at,
+       created_by,
+       created_at::text AS created_at
+     FROM overrides
+     WHERE (starts_at IS NULL OR starts_at <= $1)
+       AND (ends_at IS NULL OR ends_at > $2)
+     ORDER BY created_at DESC, xmin::text::bigint DESC, ctid DESC`;
 
 vi.mock("../lib/status-engine", () => ({
   recomputePublicStatus: vi.fn(),
@@ -52,40 +124,59 @@ vi.mock("../lib/status-engine", () => ({
 
 const recomputePublicStatus = vi.mocked(statusEngineModule.recomputePublicStatus);
 
-function createCtx(): ExecutionContext {
-  return {
-    waitUntil() {},
+function createCtx() {
+  const deferred: Promise<unknown>[] = [];
+  const defer = vi.fn((promise: Promise<unknown>) => {
+    deferred.push(promise);
+  });
+  const waitUntil = vi.fn((promise: Promise<unknown>) => {
+    deferred.push(promise);
+  });
+  const ctx = {
+    defer,
+    waitUntil,
     passThroughOnException() {},
     props: {},
+  } as RuntimeContext & { defer: typeof defer };
+
+  return {
+    ...ctx,
+    ctx,
+    defer,
+    waitUntil,
+    deferred,
+  };
+}
+
+function createDefaultDb() {
+  return {
+    unsafe: async () => {
+      throw new Error("db.unsafe should not be called");
+    },
+    begin: async () => {
+      throw new Error("db.begin should not be called");
+    },
   };
 }
 
 function createEnv({
-  prepare,
+  db,
+  adminApiToken,
+  probeApiToken,
 }: {
-  prepare?: D1Database["prepare"];
+  db?: unknown;
+  adminApiToken?: string;
+  probeApiToken?: string;
 } = {}): Env {
-  const assets = {
-    fetch: async () => new Response("asset fallback"),
-  } as unknown as Fetcher;
-
-  const statusSnapshots = {
-    get: async () => null,
-  } as unknown as KVNamespace;
-
   return {
-    ADMIN_API_TOKEN: "test-admin-token",
-    PROBE_API_TOKEN: "probe-token",
-    ASSETS: assets,
-    STATUS_SNAPSHOTS: statusSnapshots,
-    DB: {
-      prepare:
-        prepare ??
-        (() => {
-          throw new Error("DB.prepare should not be called");
-        }),
-    } as D1Database,
-  };
+    ASSETS: {
+      fetch: async () => new Response("asset fallback"),
+    },
+    db: db ?? createDefaultDb(),
+    adminApiToken:
+      adminApiToken !== undefined ? adminApiToken : "test-admin-token",
+    probeApiToken: probeApiToken !== undefined ? probeApiToken : "probe-token",
+  } as unknown as Env;
 }
 
 afterEach(() => {
@@ -104,51 +195,36 @@ beforeEach(() => {
 
 describe("admin override route", () => {
   it("returns the editable service catalog with nested components", async () => {
-    const env = createEnv({
-      prepare: (sql: string) => {
-        if (sql === LIST_SERVICES_SQL) {
-          return {
-            all: async () => ({
-              results: [
-                {
-                  id: "svc_1",
-                  slug: "sub2api",
-                  name: "Sub2API",
-                  description: "Primary API",
-                  sort_order: 0,
-                  enabled: 1,
-                  status: "operational",
-                  updated_at: "2026-04-27T00:00:00.000Z",
-                },
-              ],
-            }),
-          } as D1PreparedStatement;
-        }
-
-        expect(sql).toBe(LIST_COMPONENTS_SQL);
-
-        return {
-          all: async () => ({
-            results: [
-              {
-                id: "cmp_1",
-                service_id: "svc_1",
-                slug: "sub2api-public-api",
-                name: "Public API",
-                description: "Customer traffic",
-                probe_type: "http",
-                is_critical: 1,
-                sort_order: 0,
-                enabled: 1,
-                observed_status: "operational",
-                display_status: "operational",
-                updated_at: "2026-04-27T00:00:00.000Z",
-              },
-            ],
-          }),
-        } as D1PreparedStatement;
-      },
-    });
+    const db = new RecordingSqlConnection()
+      .when(LIST_SERVICES_SQL, () => [
+        {
+          id: "svc_1",
+          slug: "sub2api",
+          name: "Sub2API",
+          description: "Primary API",
+          sort_order: 0,
+          enabled: true,
+          status: "operational",
+          updated_at: "2026-04-27T00:00:00.000Z",
+        },
+      ])
+      .when(LIST_COMPONENTS_SQL, () => [
+        {
+          id: "cmp_1",
+          service_id: "svc_1",
+          slug: "sub2api-public-api",
+          name: "Public API",
+          description: "Customer traffic",
+          probe_type: "http",
+          is_critical: true,
+          sort_order: 0,
+          enabled: true,
+          observed_status: "operational",
+          display_status: "operational",
+          updated_at: "2026-04-27T00:00:00.000Z",
+        },
+      ]);
+    const env = createEnv({ db });
 
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/admin/catalog", {
@@ -200,6 +276,55 @@ describe("admin override route", () => {
     await expect(response.text()).resolves.toBe("unauthorized");
   });
 
+  it("accepts lowercase bearer auth for admin routes", async () => {
+    const db = new RecordingSqlConnection()
+      .when(LIST_SERVICES_SQL, () => [])
+      .when(LIST_COMPONENTS_SQL, () => []);
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog", {
+        headers: { authorization: "bearer test-admin-token" },
+      }),
+      createEnv({ db }),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ services: [] });
+  });
+
+  it("rejects admin auth when the configured token is unset", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog", {
+        headers: { authorization: "Bearer " },
+      }),
+      createEnv({ adminApiToken: "" }),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(401);
+    await expect(response.text()).resolves.toBe("unauthorized");
+  });
+
+  it("returns 503 for catalog requests when the admin db contract is unavailable", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog", {
+        headers: { authorization: "Bearer test-admin-token" },
+      }),
+      createEnv({
+        db: {
+          prepare() {
+            throw new Error("legacy prepare should not be used");
+          },
+        },
+      }),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.text()).resolves.toBe("admin database unavailable");
+  });
+
   it("returns 400 for invalid service create payloads", async () => {
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/admin/services", {
@@ -245,32 +370,23 @@ describe("admin override route", () => {
   it("creates a service and recomputes the public snapshot", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T10:00:00.000Z"));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("service-123");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000123");
 
-    const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(INSERT_SERVICE_SQL);
+    const db = new RecordingSqlConnection().when(INSERT_SERVICE_SQL, (params) => {
+      expect(params).toEqual([
+        "00000000-0000-4000-8000-000000000123",
+        "sub2api-core",
+        "Sub2API Core",
+        "Primary API",
+        2,
+        false,
+        "degraded",
+        "2026-04-27T10:00:00.000Z",
+      ]);
 
-        return {
-          bind: (...params: unknown[]) => {
-            expect(params).toEqual([
-              "service-123",
-              "sub2api-core",
-              "Sub2API Core",
-              "Primary API",
-              2,
-              0,
-              "degraded",
-              "2026-04-27T10:00:00.000Z",
-            ]);
-
-            return {
-              run: async () => ({ meta: { changes: 1 } }),
-            };
-          },
-        } as D1PreparedStatement;
-      },
+      return [{ id: "00000000-0000-4000-8000-000000000123" }];
     });
+    const env = createEnv({ db });
 
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/admin/services", {
@@ -295,8 +411,7 @@ describe("admin override route", () => {
     expect(response.status).toBe(201);
     await expect(response.json()).resolves.toEqual({ created: true });
     expect(recomputePublicStatus).toHaveBeenCalledWith(
-      env.DB,
-      env.STATUS_SNAPSHOTS,
+      db,
       "2026-04-27T10:00:00.000Z",
     );
   });
@@ -304,20 +419,14 @@ describe("admin override route", () => {
   it("returns 409 when service create hits a duplicate slug conflict", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T10:00:00.000Z"));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("service-123");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000123");
 
     const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(INSERT_SERVICE_SQL);
-
-        return {
-          bind: () => ({
-            run: async () => {
-              throw new Error("D1_ERROR: UNIQUE constraint failed: services.slug");
-            },
-          }),
-        } as unknown as D1PreparedStatement;
-      },
+      db: new RecordingSqlConnection().when(INSERT_SERVICE_SQL, () => {
+        throw new Error(
+          'duplicate key value violates unique constraint "services_slug_key"',
+        );
+      }),
     });
 
     const response = await worker.fetch(
@@ -345,29 +454,20 @@ describe("admin override route", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T11:00:00.000Z"));
 
-    const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(UPDATE_SERVICE_SQL);
+    const db = new RecordingSqlConnection().when(UPDATE_SERVICE_SQL, (params) => {
+      expect(params).toEqual([
+        "sub2api-core",
+        "Sub2API Core",
+        "Renamed primary API",
+        3,
+        false,
+        "2026-04-27T11:00:00.000Z",
+        "sub2api",
+      ]);
 
-        return {
-          bind: (...params: unknown[]) => {
-            expect(params).toEqual([
-              "sub2api-core",
-              "Sub2API Core",
-              "Renamed primary API",
-              3,
-              0,
-              "2026-04-27T11:00:00.000Z",
-              "sub2api",
-            ]);
-
-            return {
-              run: async () => ({ meta: { changes: 1 } }),
-            };
-          },
-        } as D1PreparedStatement;
-      },
+      return [{ id: "svc_1" }];
     });
+    const env = createEnv({ db });
 
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/admin/services/sub2api", {
@@ -437,17 +537,11 @@ describe("admin override route", () => {
     vi.setSystemTime(new Date("2026-04-27T11:00:00.000Z"));
 
     const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(UPDATE_SERVICE_SQL);
-
-        return {
-          bind: () => ({
-            run: async () => {
-              throw new Error("D1_ERROR: UNIQUE constraint failed: services.slug");
-            },
-          }),
-        } as unknown as D1PreparedStatement;
-      },
+      db: new RecordingSqlConnection().when(UPDATE_SERVICE_SQL, () => {
+        throw new Error(
+          'duplicate key value violates unique constraint "services_slug_key"',
+        );
+      }),
     });
 
     const response = await worker.fetch(
@@ -470,37 +564,100 @@ describe("admin override route", () => {
     expect(recomputePublicStatus).not.toHaveBeenCalled();
   });
 
+  it("returns 404 for a service patch path with an empty slug", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services/", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ name: "ignored" }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(404);
+    await expect(response.text()).resolves.toBe("not found");
+  });
+
+  it("returns 404 for a service patch path with extra segments", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services/sub2api/extra", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ name: "ignored" }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(404);
+    await expect(response.text()).resolves.toBe("not found");
+  });
+
+  it("returns 404 for unsupported admin patch paths", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/catalog", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ ignored: true }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(404);
+    await expect(response.text()).resolves.toBe("not found");
+  });
+
+  it("returns 404 for the bare admin patch path", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin", {
+        method: "PATCH",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ ignored: true }),
+      }),
+      createEnv(),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(404);
+    await expect(response.text()).resolves.toBe("not found");
+  });
+
   it("creates a component under an existing service", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T12:00:00.000Z"));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("component-123");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000456");
 
-    const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(INSERT_COMPONENT_SQL);
+    const db = new RecordingSqlConnection().when(INSERT_COMPONENT_SQL, (params) => {
+      expect(params).toEqual([
+        "00000000-0000-4000-8000-000000000456",
+        "sub2api-health",
+        "Health",
+        "Health endpoint",
+        "http",
+        true,
+        30,
+        true,
+        "2026-04-27T12:00:00.000Z",
+        "sub2api",
+      ]);
 
-        return {
-          bind: (...params: unknown[]) => {
-            expect(params).toEqual([
-              "component-123",
-              "sub2api-health",
-              "Health",
-              "Health endpoint",
-              "http",
-              1,
-              30,
-              1,
-              "2026-04-27T12:00:00.000Z",
-              "sub2api",
-            ]);
-
-            return {
-              run: async () => ({ meta: { changes: 1 } }),
-            };
-          },
-        } as D1PreparedStatement;
-      },
+      return [{ id: "00000000-0000-4000-8000-000000000456" }];
     });
+    const env = createEnv({ db });
 
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/admin/components", {
@@ -532,31 +689,22 @@ describe("admin override route", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T12:30:00.000Z"));
 
-    const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(UPDATE_COMPONENT_SQL);
+    const db = new RecordingSqlConnection().when(UPDATE_COMPONENT_SQL, (params) => {
+      expect(params).toEqual([
+        "sub2api-healthz",
+        "Healthz",
+        "Renamed health endpoint",
+        "tcp",
+        false,
+        40,
+        false,
+        "2026-04-27T12:30:00.000Z",
+        "sub2api-health",
+      ]);
 
-        return {
-          bind: (...params: unknown[]) => {
-            expect(params).toEqual([
-              "sub2api-healthz",
-              "Healthz",
-              "Renamed health endpoint",
-              "tcp",
-              0,
-              40,
-              0,
-              "2026-04-27T12:30:00.000Z",
-              "sub2api-health",
-            ]);
-
-            return {
-              run: async () => ({ meta: { changes: 1 } }),
-            };
-          },
-        } as D1PreparedStatement;
-      },
+      return [{ id: "cmp_1" }];
     });
+    const env = createEnv({ db });
 
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/admin/components/sub2api-health", {
@@ -582,8 +730,7 @@ describe("admin override route", () => {
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ updated: true });
     expect(recomputePublicStatus).toHaveBeenCalledWith(
-      env.DB,
-      env.STATUS_SNAPSHOTS,
+      db,
       "2026-04-27T12:30:00.000Z",
     );
   });
@@ -614,20 +761,14 @@ describe("admin override route", () => {
   it("returns 409 when component create hits a duplicate slug conflict", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T12:00:00.000Z"));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("component-123");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000456");
 
     const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(INSERT_COMPONENT_SQL);
-
-        return {
-          bind: () => ({
-            run: async () => {
-              throw new Error("D1_ERROR: UNIQUE constraint failed: components.slug");
-            },
-          }),
-        } as unknown as D1PreparedStatement;
-      },
+      db: new RecordingSqlConnection().when(INSERT_COMPONENT_SQL, () => {
+        throw new Error(
+          'duplicate key value violates unique constraint "components_slug_key"',
+        );
+      }),
     });
 
     const response = await worker.fetch(
@@ -654,36 +795,42 @@ describe("admin override route", () => {
     expect(recomputePublicStatus).not.toHaveBeenCalled();
   });
 
+  it("returns 503 for admin writes when the admin db contract is unavailable", async () => {
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/admin/services", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer test-admin-token",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          slug: "sub2api-core",
+          name: "Sub2API Core",
+        }),
+      }),
+      createEnv({
+        db: {
+          prepare() {
+            throw new Error("legacy prepare should not be used");
+          },
+        },
+      }),
+      createCtx(),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.text()).resolves.toBe("admin database unavailable");
+    expect(recomputePublicStatus).not.toHaveBeenCalled();
+  });
+
   it("reorders services and components in one request", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T13:00:00.000Z"));
 
-    const prepare = vi.fn((sql: string) => {
-      const normalizedSql = normalizeSql(sql);
-
-      if (
-        normalizedSql === normalizeSql(UPDATE_SERVICE_ORDER_SQL) ||
-        normalizedSql === normalizeSql(UPDATE_COMPONENT_ORDER_SQL)
-      ) {
-        return {
-          bind: (...params: unknown[]) => ({
-            sql: normalizedSql,
-            params,
-          }),
-        } as unknown as D1PreparedStatement;
-      }
-
-      throw new Error(`Unexpected SQL: ${sql}`);
-    });
-    const batch = vi.fn(async () => []);
-
-    const env = {
-      ...createEnv({ prepare }),
-      DB: {
-        prepare,
-        batch,
-      } as unknown as D1Database,
-    };
+    const db = new RecordingSqlConnection()
+      .when(UPDATE_SERVICE_ORDER_SQL, () => [])
+      .when(UPDATE_COMPONENT_ORDER_SQL, () => []);
+    const env = createEnv({ db });
 
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/admin/catalog/reorder", {
@@ -703,8 +850,12 @@ describe("admin override route", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toEqual({ updated: true });
-    expect(batch).toHaveBeenCalledTimes(1);
-    expect(batch).toHaveBeenCalledWith([
+    expect(
+      db.log.map((entry) => ({
+        sql: normalizeSql(entry.query),
+        params: entry.params,
+      })),
+    ).toEqual([
       {
         sql: normalizeSql(UPDATE_SERVICE_ORDER_SQL),
         params: [20, "2026-04-27T13:00:00.000Z", "sub2api"],
@@ -855,24 +1006,16 @@ describe("admin override route", () => {
     });
 
     const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(OVERRIDE_SQL);
+      db: new RecordingSqlConnection().when(OVERRIDE_SQL, (params) => {
+        expect(params?.[1]).toBe("component");
+        expect(params?.[2]).toBe("degraded");
+        expect(params?.[3]).toBe("Increased latency under investigation");
+        expect(params?.[4]).toBeNull();
+        expect(params?.[5]).toBeNull();
+        expect(params?.[7]).toBe("missing-component");
 
-        return {
-          bind: (...params: unknown[]) => ({
-            run: async () => {
-              expect(params[1]).toBe("component");
-              expect(params[2]).toBe("degraded");
-              expect(params[3]).toBe("Increased latency under investigation");
-              expect(params[4]).toBeNull();
-              expect(params[5]).toBeNull();
-              expect(params[7]).toBe("missing-component");
-
-              return { meta: { changes: 0 } };
-            },
-          }),
-        } as D1PreparedStatement;
-      },
+        return [];
+      }),
     });
 
     const response = await worker.fetch(request, env, createCtx());
@@ -884,7 +1027,7 @@ describe("admin override route", () => {
   it("stores an operator-issued component override", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T08:00:00.000Z"));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("override-123");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000789");
 
     const request = new Request("https://flarestatus.test/api/admin/overrides", {
       method: "POST",
@@ -905,31 +1048,21 @@ describe("admin override route", () => {
     let runCalled = false;
 
     const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(OVERRIDE_SQL);
+      db: new RecordingSqlConnection().when(OVERRIDE_SQL, (params) => {
+        expect(params).toEqual([
+          "00000000-0000-4000-8000-000000000789",
+          "component",
+          "degraded",
+          "Increased latency under investigation",
+          "2026-04-27T08:00:00.000Z",
+          "2026-04-27T10:00:00.000Z",
+          "2026-04-27T08:00:00.000Z",
+          "sub2api-public-api",
+        ]);
 
-        return {
-          bind: (...params: unknown[]) => {
-            expect(params).toEqual([
-              "override-123",
-              "component",
-              "degraded",
-              "Increased latency under investigation",
-              "2026-04-27T08:00:00.000Z",
-              "2026-04-27T10:00:00.000Z",
-              "2026-04-27T08:00:00.000Z",
-              "sub2api-public-api",
-            ]);
-
-            return {
-              run: async () => {
-                runCalled = true;
-                return { meta: { changes: 1 } };
-              },
-            };
-          },
-        } as D1PreparedStatement;
-      },
+        runCalled = true;
+        return [{ id: "00000000-0000-4000-8000-000000000789" }];
+      }),
     });
 
     const response = await worker.fetch(request, env, createCtx());
@@ -938,8 +1071,7 @@ describe("admin override route", () => {
     expect(response.status).toBe(201);
     await expect(response.json()).resolves.toEqual({ created: true });
     expect(recomputePublicStatus).toHaveBeenCalledWith(
-      env.DB,
-      env.STATUS_SNAPSHOTS,
+      (env as Env & { db: RecordingSqlConnection }).db,
       "2026-04-27T08:00:00.000Z",
     );
   });
@@ -947,11 +1079,11 @@ describe("admin override route", () => {
   it("returns 201 after an override insert even if recompute fails", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T08:00:00.000Z"));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("override-123");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000789");
     const consoleError = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
-    const waitUntil = vi.fn(async (promise: Promise<unknown>) => {
+    const defer = vi.fn(async (promise: Promise<unknown>) => {
       await promise;
     });
     recomputePublicStatus.mockRejectedValueOnce(new Error("kv unavailable"));
@@ -971,27 +1103,21 @@ describe("admin override route", () => {
     });
 
     const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(OVERRIDE_SQL);
-
-        return {
-          bind: () => ({
-            run: async () => ({ meta: { changes: 1 } }),
-          }),
-        } as D1PreparedStatement;
-      },
+      db: new RecordingSqlConnection().when(OVERRIDE_SQL, () => [
+        { id: "00000000-0000-4000-8000-000000000789" },
+      ]),
     });
     const ctx = {
-      waitUntil,
+      defer,
       passThroughOnException() {},
       props: {},
-    } satisfies ExecutionContext;
+    } as RuntimeContext & { defer: typeof defer };
 
     const response = await worker.fetch(request, env, ctx);
 
     expect(response.status).toBe(201);
     await expect(response.json()).resolves.toEqual({ created: true });
-    expect(waitUntil).toHaveBeenCalledTimes(1);
+    expect(defer).toHaveBeenCalledTimes(1);
     expect(consoleError).toHaveBeenCalledWith(
       "failed to recompute public status after admin override insert",
       expect.any(Error),
@@ -1001,7 +1127,7 @@ describe("admin override route", () => {
   it("stores an announcement and recomputes the public snapshot", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T08:30:00.000Z"));
-    vi.spyOn(crypto, "randomUUID").mockReturnValue("announcement-123");
+    vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000abc");
 
     const request = new Request(
       "https://flarestatus.test/api/admin/announcements",
@@ -1024,30 +1150,20 @@ describe("admin override route", () => {
     let runCalled = false;
 
     const env = createEnv({
-      prepare: (sql: string) => {
-        expect(sql).toBe(ANNOUNCEMENT_SQL);
+      db: new RecordingSqlConnection().when(ANNOUNCEMENT_SQL, (params) => {
+        expect(params).toEqual([
+          "00000000-0000-4000-8000-000000000abc",
+          "Scheduled maintenance",
+          "API traffic may be intermittently unavailable.",
+          "partial_outage",
+          "2026-04-27T08:30:00.000Z",
+          "2026-04-27T09:30:00.000Z",
+          "2026-04-27T08:30:00.000Z",
+        ]);
 
-        return {
-          bind: (...params: unknown[]) => {
-            expect(params).toEqual([
-              "announcement-123",
-              "Scheduled maintenance",
-              "API traffic may be intermittently unavailable.",
-              "partial_outage",
-              "2026-04-27T08:30:00.000Z",
-              "2026-04-27T09:30:00.000Z",
-              "2026-04-27T08:30:00.000Z",
-            ]);
-
-            return {
-              run: async () => {
-                runCalled = true;
-                return { meta: { changes: 1 } };
-              },
-            };
-          },
-        } as D1PreparedStatement;
-      },
+        runCalled = true;
+        return [{ id: "00000000-0000-4000-8000-000000000abc" }];
+      }),
     });
 
     const response = await worker.fetch(request, env, createCtx());
@@ -1056,8 +1172,7 @@ describe("admin override route", () => {
     expect(response.status).toBe(201);
     await expect(response.json()).resolves.toEqual({ created: true });
     expect(recomputePublicStatus).toHaveBeenCalledWith(
-      env.DB,
-      env.STATUS_SNAPSHOTS,
+      (env as Env & { db: RecordingSqlConnection }).db,
       "2026-04-27T08:30:00.000Z",
     );
   });
@@ -1109,5 +1224,58 @@ describe("admin override route", () => {
 
     expect(response.status).toBe(400);
     await expect(response.text()).resolves.toBe("invalid payload");
+  });
+});
+
+describe("db probe result query", () => {
+  it("uses insertion metadata as the stable tie-break when checked_at is identical", async () => {
+    const rows = [
+      {
+        id: "probe-latest",
+        component_id: "cmp_1",
+        probe_source: "probe-a",
+        status: "major_outage",
+        latency_ms: 900,
+        http_code: 503,
+        summary: "later insert",
+        raw_payload: "{}",
+        checked_at: "2026-04-27T10:00:00.000Z",
+      },
+    ];
+    const db = new RecordingSqlConnection().when(
+      LIST_LATEST_PROBE_RESULTS_SQL,
+      () => rows,
+    );
+
+    await expect(listLatestProbeResults(db)).resolves.toEqual(rows);
+    expect(normalizeSql(db.log[0]?.query ?? "")).toBe(
+      normalizeSql(LIST_LATEST_PROBE_RESULTS_SQL),
+    );
+  });
+});
+
+describe("db active override query", () => {
+  it("uses insertion metadata as the stable tie-break when created_at is identical", async () => {
+    const rows = [
+      {
+        id: "ovr-latest",
+        target_type: "component",
+        target_id: "cmp_1",
+        override_status: "major_outage",
+        message: "later insert",
+        starts_at: null,
+        ends_at: null,
+        created_by: "operator",
+        created_at: "2026-04-27T10:00:00.000Z",
+      },
+    ];
+    const db = new RecordingSqlConnection().when(LIST_ACTIVE_OVERRIDES_SQL, () => rows);
+
+    await expect(
+      listActiveOverrides(db, "2026-04-27T10:00:00.000Z"),
+    ).resolves.toEqual(rows);
+    expect(normalizeSql(db.log[0]?.query ?? "")).toBe(
+      normalizeSql(LIST_ACTIVE_OVERRIDES_SQL),
+    );
   });
 });

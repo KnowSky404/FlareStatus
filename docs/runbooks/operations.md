@@ -1,191 +1,144 @@
 # Operations Guide
 
-## Overview
-
-This guide covers day-2 operation of FlareStatus:
-
-- checking health
-- operating the admin console
-- posting overrides
-- posting announcements
-- validating probe flow
-- handling common local and production issues
-
-## Public Status Checks
+## Public Checks
 
 Read the current snapshot:
 
 ```bash
-curl https://<worker-host>/api/public/status
+curl http://127.0.0.1:3000/api/public/status
 ```
 
 Key fields:
 
-- `summary.status`: overall status
-- `announcements[]`: active notices
-- `services[].status`: service-level status
-- `services[].components[].displayStatus`: component-level status shown publicly
-
-## Operator Actions
+- `summary.status`
+- `announcements[]`
+- `services[].status`
+- `services[].components[].displayStatus`
 
 ## Admin Console
 
 Open:
 
 ```text
-https://<worker-host>/admin
+http://127.0.0.1:3000/admin
 ```
 
 Recommended protection model:
 
-- place `/admin` behind Cloudflare Access or an equivalent edge access layer
-- keep `ADMIN_API_TOKEN` restricted to operators
+- keep `/admin` behind your reverse proxy auth layer when exposed publicly
+- restrict `ADMIN_API_TOKEN` to operators
 
 Current UI behavior:
 
-- the page loads public preview data without the admin token
-- editable catalog and write operations require an `ADMIN_API_TOKEN`
-- the page stores the token in browser local storage for the current browser profile
-
-Use the admin console for:
-
-- creating and editing services
-- creating and editing components
-- enabling or disabling services/components
-- posting overrides
-- posting announcements
-
-Disabled catalog rows remain editable in `/admin` but are hidden from `/api/public/status`.
+- the page loads without a login flow
+- write operations require `ADMIN_API_TOKEN`
+- the browser stores the token locally for the current profile
 
 ## Catalog API Examples
 
 Read the editable catalog:
 
 ```bash
-curl https://<worker-host>/api/admin/catalog \
+curl http://127.0.0.1:3000/api/admin/catalog \
   -H 'Authorization: Bearer <admin-token>'
 ```
 
 Create a service:
 
 ```bash
-curl -X POST https://<worker-host>/api/admin/services \
+curl -X POST http://127.0.0.1:3000/api/admin/services \
   -H 'Authorization: Bearer <admin-token>' \
   -H 'Content-Type: application/json' \
-  --data '{"slug":"sub2api-core","name":"Sub2API Core","description":"Primary API","sortOrder":10,"enabled":true}'
+  --data '{"slug":"sub2api","name":"Sub2API","description":"Primary API","sortOrder":20,"enabled":true}'
 ```
 
 Create a component:
 
 ```bash
-curl -X POST https://<worker-host>/api/admin/components \
+curl -X POST http://127.0.0.1:3000/api/admin/components \
   -H 'Authorization: Bearer <admin-token>' \
   -H 'Content-Type: application/json' \
-  --data '{"serviceSlug":"sub2api","slug":"sub2api-health","name":"Health","probeType":"http","isCritical":true,"sortOrder":20,"enabled":true}'
+  --data '{"serviceSlug":"sub2api","slug":"sub2api-health","name":"Health","probeType":"http","isCritical":true,"sortOrder":10,"enabled":true}'
 ```
 
-Batch reorder:
+Reorder:
 
 ```bash
-curl -X POST https://<worker-host>/api/admin/catalog/reorder \
+curl -X POST http://127.0.0.1:3000/api/admin/catalog/reorder \
   -H 'Authorization: Bearer <admin-token>' \
   -H 'Content-Type: application/json' \
   --data '{"services":[{"slug":"sub2api","sortOrder":10}],"components":[{"slug":"sub2api-health","sortOrder":20}]}'
 ```
 
-## Apply an override
+## Overrides and Announcements
 
-Use an override when operator intent should temporarily replace observed state.
-
-Component override example:
+Component override:
 
 ```bash
-curl -X POST https://<worker-host>/api/admin/overrides \
+curl -X POST http://127.0.0.1:3000/api/admin/overrides \
   -H 'Authorization: Bearer <admin-token>' \
   -H 'Content-Type: application/json' \
-  --data '{"targetType":"component","targetSlug":"sub2api-public-api","overrideStatus":"degraded","message":"Investigating elevated latency"}'
+  --data '{"targetType":"component","targetSlug":"flarestatus-public-api","overrideStatus":"degraded","message":"Investigating elevated latency"}'
 ```
 
-Service override example:
+Announcement:
 
 ```bash
-curl -X POST https://<worker-host>/api/admin/overrides \
-  -H 'Authorization: Bearer <admin-token>' \
-  -H 'Content-Type: application/json' \
-  --data '{"targetType":"service","targetSlug":"sub2api","overrideStatus":"major_outage","message":"Regional outage in progress"}'
-```
-
-Optional timed window:
-
-```json
-{
-  "startsAt": "2026-04-28T09:00:00.000Z",
-  "endsAt": "2026-04-28T11:00:00.000Z"
-}
-```
-
-Rules:
-
-- timestamps must be strict UTC ISO-8601 with millisecond precision
-- `endsAt` must be later than `startsAt`
-- only active overrides affect `displayStatus`
-
-## Publish an announcement
-
-```bash
-curl -X POST https://<worker-host>/api/admin/announcements \
+curl -X POST http://127.0.0.1:3000/api/admin/announcements \
   -H 'Authorization: Bearer <admin-token>' \
   -H 'Content-Type: application/json' \
   --data '{"title":"Scheduled maintenance","body":"Database failover in progress.","statusLevel":"partial_outage"}'
 ```
 
-Timed announcements use the same `startsAt` / `endsAt` rules as overrides.
+Timed windows still use `startsAt` and `endsAt` in strict UTC ISO-8601 format.
 
 ## Probe Operations
 
-## Run a one-shot smoke probe
+If you want to run the repository-managed probe container, start it with the override file:
 
 ```bash
-export PROBE_COMPONENT_SLUG=sub2api-public-api
-export PROBE_REPORT_ENDPOINT=https://<worker-host>/api/probe/report
-export PROBE_REPORT_TOKEN=<probe-token>
-export PROBE_CHECK_TYPE=http
-export PROBE_HTTP_URL=https://<worker-host>/api/public/status
-export PROBE_RUN_ONCE=true
-pnpm --filter probe start
+docker compose -f docker-compose.yml -f docker-compose.probe.yml up -d probe
 ```
 
-Use this after deployment, secret rotation, or route changes.
-
-## Run a looping probe
+One-shot smoke probe:
 
 ```bash
-export PROBE_COMPONENT_SLUG=sub2api-public-api
-export PROBE_REPORT_ENDPOINT=https://<worker-host>/api/probe/report
+export PROBE_COMPONENT_SLUG=flarestatus-public-api
+export PROBE_REPORT_ENDPOINT=http://127.0.0.1:3000/api/probe/report
+export PROBE_REPORT_TOKEN=<probe-token>
+export PROBE_CHECK_TYPE=http
+export PROBE_HTTP_URL=http://127.0.0.1:3000/api/public/status
+export PROBE_RUN_ONCE=true
+bun --filter probe start
+```
+
+Looping probe:
+
+```bash
+export PROBE_COMPONENT_SLUG=flarestatus-public-api
+export PROBE_REPORT_ENDPOINT=http://127.0.0.1:3000/api/probe/report
 export PROBE_REPORT_TOKEN=<probe-token>
 export PROBE_CHECK_TYPE=http
 export PROBE_HTTP_URL=https://service.example/health
 export PROBE_INTERVAL_MS=30000
-pnpm --filter probe start
+bun --filter probe start
 ```
 
-## Expected probe behaviors
+Expected check behavior:
 
-- HTTP: healthy when the response status is in `PROBE_HTTP_EXPECTED_STATUS`
-- TCP: healthy when the socket connects before timeout
-- Redis: healthy only on valid `PONG`
-- Postgres: healthy only when `SELECT 1` succeeds
+- HTTP: success when the response status is in `PROBE_HTTP_EXPECTED_STATUS`
+- TCP: success when the socket connects before timeout
+- Redis: success only on `PONG`
+- Postgres: success only when `SELECT 1` succeeds
 
 ## Smoke Checklist
 
-Use this checklist after deployment or incident recovery:
-
 1. `GET /api/public/status` returns `200`
-2. `services` is populated
+2. the expected service/component appears in `services`
 3. a one-shot probe can post successfully
 4. `/admin` loads and can fetch `/api/admin/catalog`
-5. disabling a component removes it from `services[].components`
-6. an override changes the visible service/component status
+5. disabling a component removes it from the public snapshot
+6. an override changes the visible public status
 7. an announcement appears in `announcements`
 
 ## Troubleshooting
@@ -194,62 +147,39 @@ Use this checklist after deployment or incident recovery:
 
 Check:
 
-- the Worker secret `PROBE_API_TOKEN`
-- the probe env var `PROBE_REPORT_TOKEN`
+- `PROBE_API_TOKEN` in the app container
+- `PROBE_REPORT_TOKEN` in the probe environment
 - the `Authorization: Bearer ...` header
-
-The probe token must match the Worker secret exactly.
 
 ## `401 unauthorized` on admin routes
 
 Check:
 
-- the Worker secret `ADMIN_API_TOKEN`
-- the token used in the admin request
-- whether the browser token stored in `/admin` is stale
+- `ADMIN_API_TOKEN` in the app container
+- the token sent by the client
+- whether the browser has a stale token cached for `/admin`
 
 ## `404 component not found` on probe ingest
 
 Check:
 
 - `PROBE_COMPONENT_SLUG`
-- `components.slug` in D1
+- the matching `components.slug` row in PostgreSQL
 
-The ingest route only accepts existing component slugs.
-
-## Override created but public status does not change immediately
-
-Check `/api/public/status` again after the request returns.
-
-In local Wrangler + D1 development, simultaneous `wrangler d1 execute --local` commands can contend on the same SQLite file and briefly surface stale reads or `SQLITE_BUSY`. Avoid mixing manual D1 CLI writes with live smoke requests against the same local instance.
-
-## Announcement missing from public snapshot
+## Public snapshot looks stale
 
 Check:
 
-- `startsAt` / `endsAt`
-- current UTC time
-- whether the announcement row exists in D1
-
-Only active announcement windows are returned publicly.
-
-## Local development token confusion
-
-For local `wrangler dev`, prefer `.dev.vars` for:
-
-- `PROBE_API_TOKEN`
-- `ADMIN_API_TOKEN`
-
-Shell exports alone may not be sufficient for local Worker bindings in every environment.
+- whether the last probe run succeeded
+- whether an override or announcement window is still active
+- app logs for snapshot recompute failures
 
 ## Verification Commands
 
-Repository verification:
-
 ```bash
-pnpm vitest run src/tests/admin-route.test.ts src/tests/public-route.test.ts src/tests/status-engine.test.ts
-pnpm test
-pnpm --filter probe test
-pnpm typecheck
-pnpm --filter probe exec tsc -p tsconfig.json --noEmit
+bun run test
+bun --filter probe test
+bun run typecheck
+docker compose -f docker-compose.yml config
+docker compose -f docker-compose.yml -f docker-compose.probe.yml config
 ```

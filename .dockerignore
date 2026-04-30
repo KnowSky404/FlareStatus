@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+dist
+coverage
+.DS_Store
+
+docs/superpowers
+src/tests
+probe/src/tests
+
+tmp
+*.log

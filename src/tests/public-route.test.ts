@@ -1,7 +1,11 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import type { Env } from "../lib/env";
+import type { AppDatabase, Env, RuntimeContext } from "../lib/env";
 import { recomputePublicStatus } from "../lib/status-engine";
+import {
+  CURRENT_PUBLIC_SNAPSHOT_KEY,
+  loadPublicSnapshot,
+} from "../lib/snapshots";
 import * as dbModule from "../lib/db";
 import type {
   AnnouncementRow,
@@ -10,6 +14,9 @@ import type {
   ProbeResultRow,
   ServiceRow,
 } from "../types";
+import { dispatchRequest } from "../app";
+import { createAssetsFetcher, createServerFetch } from "../server";
+import { RecordingSqlConnection } from "./helpers/postgres";
 import worker from "../worker";
 
 vi.mock("../lib/db", async (importOriginal) => {
@@ -19,7 +26,6 @@ vi.mock("../lib/db", async (importOriginal) => {
     ...actual,
     listServicesWithComponents: vi.fn(),
     listLatestProbeResults: vi.fn(),
-    persistStatusUpdates: vi.fn(),
   };
 });
 
@@ -46,13 +52,141 @@ interface PublicStatusPayload {
   }>;
 }
 
+const LIST_ACTIVE_OVERRIDES_SQL = `SELECT
+       id,
+       target_type,
+       target_id,
+       override_status,
+       message,
+       starts_at::text AS starts_at,
+       ends_at::text AS ends_at,
+       created_by,
+       created_at::text AS created_at
+     FROM overrides
+     WHERE (starts_at IS NULL OR starts_at <= $1)
+       AND (ends_at IS NULL OR ends_at > $2)
+     ORDER BY created_at DESC, xmin::text::bigint DESC, ctid DESC`;
+
+const LIST_ACTIVE_ANNOUNCEMENTS_SQL = `SELECT
+       id,
+       title,
+       body,
+       status_level,
+       starts_at::text AS starts_at,
+       ends_at::text AS ends_at,
+       created_at::text AS created_at
+     FROM announcements
+     WHERE (starts_at IS NULL OR starts_at <= $1)
+       AND (ends_at IS NULL OR ends_at > $2)
+     ORDER BY created_at DESC`;
+
+const UPSERT_PUBLIC_SNAPSHOT_SQL = `INSERT INTO public_snapshots (key, payload, generated_at, updated_at)
+     VALUES ($1, $2::jsonb, $3, $3)
+     ON CONFLICT (key)
+     DO UPDATE SET payload = EXCLUDED.payload,
+                   generated_at = EXCLUDED.generated_at,
+                   updated_at = EXCLUDED.updated_at`;
+
+const LOAD_PUBLIC_SNAPSHOT_SQL = `SELECT payload::text AS payload
+     FROM public_snapshots
+     WHERE key = $1
+     LIMIT 1`;
+
+const UPDATE_COMPONENT_STATUS_SQL = `UPDATE components
+            SET observed_status = $1, display_status = $2, updated_at = $3
+            WHERE id = $4`;
+
+const UPDATE_SERVICE_STATUS_SQL = `UPDATE services
+            SET status = $1, updated_at = $2
+            WHERE id = $3`;
+
+const LIST_SERVICES_SQL = `SELECT
+       id,
+       slug,
+       name,
+       description,
+       sort_order,
+       enabled,
+       status,
+       updated_at::text AS updated_at
+     FROM services
+     ORDER BY sort_order`;
+
+const LIST_COMPONENTS_SQL = `SELECT
+       id,
+       service_id,
+       slug,
+       name,
+       description,
+       probe_type,
+       is_critical,
+       sort_order,
+       enabled,
+       observed_status,
+       display_status,
+       updated_at::text AS updated_at
+     FROM components
+     ORDER BY sort_order`;
+
+function createSnapshotBackedDb({
+  snapshot,
+  overrides = [],
+  announcements = [],
+}: {
+  snapshot?: unknown;
+  overrides?: OverrideRow[];
+  announcements?: AnnouncementRow[];
+} = {}): AppDatabase {
+  const snapshots = new Map<string, string>();
+
+  if (snapshot !== undefined) {
+    snapshots.set(CURRENT_PUBLIC_SNAPSHOT_KEY, JSON.stringify(snapshot));
+  }
+
+  return new RecordingSqlConnection()
+    .when(UPSERT_PUBLIC_SNAPSHOT_SQL, (params) => {
+      const [key, payload] = params as [string, unknown, string];
+      snapshots.set(key, JSON.stringify(payload));
+      return [];
+    })
+    .when(LOAD_PUBLIC_SNAPSHOT_SQL, (params) => {
+      const [key] = params as [string];
+      const payload = snapshots.get(key);
+
+      return payload ? [{ payload }] : [];
+    })
+    .when(LIST_ACTIVE_OVERRIDES_SQL, (params) => {
+      const [startsAtBoundary, endsAtBoundary] = params as [string, string];
+
+      return overrides
+        .filter(
+          (row) =>
+            (row.starts_at === null || row.starts_at <= startsAtBoundary) &&
+            (row.ends_at === null || row.ends_at > endsAtBoundary),
+        )
+        .sort((left, right) => right.created_at.localeCompare(left.created_at));
+    })
+    .when(LIST_ACTIVE_ANNOUNCEMENTS_SQL, (params) => {
+      const [startsAtBoundary, endsAtBoundary] = params as [string, string];
+
+      return announcements
+        .filter(
+          (row) =>
+            (row.starts_at === null || row.starts_at <= startsAtBoundary) &&
+            (row.ends_at === null || row.ends_at > endsAtBoundary),
+        )
+        .sort((left, right) => right.created_at.localeCompare(left.created_at));
+    })
+    .when(UPDATE_COMPONENT_STATUS_SQL, () => [])
+    .when(UPDATE_SERVICE_STATUS_SQL, () => []);
+}
+
 function createEnv(
   input:
     | unknown
     | {
         snapshot?: unknown;
-        db?: D1Database;
-        kvPut?: (key: string, value: string) => Promise<void>;
+        db?: AppDatabase;
       } = {},
 ): Env {
   if (input === undefined) {
@@ -64,39 +198,29 @@ function createEnv(
     typeof input === "object" &&
     (Object.keys(input).length === 0 ||
       "snapshot" in input ||
-      "db" in input ||
-      "kvPut" in input)
+      "db" in input)
       ? (input as {
           snapshot?: unknown;
-          db?: D1Database;
-          kvPut?: (key: string, value: string) => Promise<void>;
+          db?: AppDatabase;
         })
       : { snapshot: input };
-  const { snapshot, db, kvPut } = options;
-
+  const { snapshot, db } = options;
   return {
-    ASSETS: ({
+    ASSETS: {
       fetch: async (_request) =>
         new Response("<html>status shell</html>", {
           headers: { "content-type": "text/html; charset=utf-8" },
         }),
-    } as Fetcher),
-    DB: db ?? ({} as D1Database),
-    STATUS_SNAPSHOTS: ({
-      get: async (key: string, options?: KVNamespaceGetOptions<"json">) => {
-        expect(key).toBe("public:current");
-        expect(options).toEqual({ type: "json" });
-
-        return snapshot ?? null;
-      },
-      put: kvPut,
-    } as KVNamespace),
+    },
+    DB:
+      db ??
+      createSnapshotBackedDb({ snapshot }),
     PROBE_API_TOKEN: "probe-token",
     ADMIN_API_TOKEN: "admin-token",
   };
 }
 
-function createCtx(): ExecutionContext {
+function createCtx(): RuntimeContext {
   return {
     waitUntil() {},
     passThroughOnException() {},
@@ -408,7 +532,6 @@ function createJsonResponse(data: unknown, ok = true) {
 
 const listServicesWithComponents = vi.mocked(dbModule.listServicesWithComponents);
 const listLatestProbeResults = vi.mocked(dbModule.listLatestProbeResults);
-const persistStatusUpdates = vi.mocked(dbModule.persistStatusUpdates);
 
 function createServiceRow(overrides: Partial<ServiceRow> = {}): ServiceRow {
   return {
@@ -490,51 +613,15 @@ function createAnnouncementRow(
 }
 
 function createTimedWindowDb({
+  snapshot,
   overrides,
   announcements,
 }: {
+  snapshot?: unknown;
   overrides: OverrideRow[];
   announcements: AnnouncementRow[];
-}): D1Database {
-  return {
-    prepare: (sql: string) => ({
-      bind: (...params: unknown[]) => ({
-        all: async () => {
-          const [startsAtBoundary, endsAtBoundary] = params as [string, string];
-
-          if (sql.includes("FROM overrides")) {
-            return {
-              results: overrides
-                .filter(
-                  (row) =>
-                    (row.starts_at === null || row.starts_at <= startsAtBoundary) &&
-                    (row.ends_at === null || row.ends_at > endsAtBoundary),
-                )
-                .sort((left, right) =>
-                  right.created_at.localeCompare(left.created_at),
-                ),
-            };
-          }
-
-          if (sql.includes("FROM announcements")) {
-            return {
-              results: announcements
-                .filter(
-                  (row) =>
-                    (row.starts_at === null || row.starts_at <= startsAtBoundary) &&
-                    (row.ends_at === null || row.ends_at > endsAtBoundary),
-                )
-                .sort((left, right) =>
-                  right.created_at.localeCompare(left.created_at),
-                ),
-            };
-          }
-
-          throw new Error(`Unexpected SQL: ${sql}`);
-        },
-      }),
-    }),
-  } as D1Database;
+}): AppDatabase {
+  return createSnapshotBackedDb({ snapshot, overrides, announcements });
 }
 
 beforeEach(() => {
@@ -545,10 +632,55 @@ beforeEach(() => {
     components: [createComponentRow()],
   });
   listLatestProbeResults.mockResolvedValue([createProbeResultRow()]);
-  persistStatusUpdates.mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe("worker asset shell", () => {
+  it("resolves the Bun root asset path to index.html", async () => {
+    const file = vi.fn(() =>
+      Object.assign(new Blob(["index"]), {
+        exists: async () => true,
+      }),
+    );
+    const fetchAsset = createAssetsFetcher("public", { file });
+
+    const response = await fetchAsset(new Request("https://flarestatus.test/"));
+
+    expect(response.status).toBe(200);
+    expect(file).toHaveBeenCalledWith("public/index.html");
+  });
+
+  it("returns a controlled 400 for malformed percent-encoded asset paths", async () => {
+    const fetchAsset = createAssetsFetcher("public", {
+      file: () =>
+        Object.assign(new Blob(["ignored"]), {
+          exists: async () => true,
+        }),
+    });
+
+    const response = await fetchAsset(
+      new Request("https://flarestatus.test/%E0%A4%A"),
+    );
+
+    expect(response.status).toBe(400);
+  });
+
+  it("dispatches the homepage through the shared app entrypoint", async () => {
+    const env = createEnv();
+
+    const response = await dispatchRequest(
+      new Request("https://flarestatus.test/"),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("status shell");
+  });
+
   it("returns the static shell for the homepage", async () => {
     const env = createEnv();
 
@@ -565,12 +697,12 @@ describe("worker asset shell", () => {
   it("serves the admin shell at /admin", async () => {
     const env = {
       ...createEnv(),
-      ASSETS: ({
+      ASSETS: {
         fetch: async (request: Request) =>
           new Response(new URL(request.url).pathname, {
             headers: { "content-type": "text/plain; charset=utf-8" },
           }),
-      } as Fetcher),
+      },
     };
 
     const response = await worker.fetch(
@@ -585,7 +717,37 @@ describe("worker asset shell", () => {
 });
 
 describe("public status route", () => {
-  it("returns the current public snapshot from KV", async () => {
+  it("routes the public status API through the Bun server fetch adapter", async () => {
+    const response = await createServerFetch(createEnv(), createCtx())(
+      new Request("https://flarestatus.test/api/public/status"),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      summary: { status: "operational" },
+    });
+  });
+
+  it("routes admin APIs through the Bun server fetch adapter", async () => {
+    vi.mocked(dbModule.listServicesWithComponents).mockResolvedValueOnce({
+      services: [],
+      components: [],
+    });
+
+    const response = await createServerFetch(
+      createEnv(),
+      createCtx(),
+    )(new Request("https://flarestatus.test/api/admin/catalog", {
+      headers: {
+        authorization: "Bearer admin-token",
+      },
+    }));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ services: [] });
+  });
+
+  it("returns the current public snapshot from postgres", async () => {
     const env = createEnv({
       generatedAt: "2026-04-27T10:00:00.000Z",
       summary: { status: "degraded" },
@@ -660,9 +822,10 @@ describe("public status route", () => {
     expect(payload.services[0]?.components[0]).toHaveProperty("id");
     expect(payload.services[0]?.components[0]).toHaveProperty("serviceId");
     expect(payload.services[0]?.components[0]).toHaveProperty("name");
+    expect(listServicesWithComponents).not.toHaveBeenCalled();
   });
 
-  it("returns the full fallback contract when KV is empty", async () => {
+  it("returns the full fallback contract when the snapshot table is empty", async () => {
     const env = createEnv();
 
     const response = await worker.fetch(
@@ -679,21 +842,61 @@ describe("public status route", () => {
     expect(payload.summary).toEqual({ status: "operational" });
     expect(payload.announcements).toEqual([]);
     expect(payload.services).toEqual([]);
+    expect(listServicesWithComponents).not.toHaveBeenCalled();
   });
 
-  it("recomputes timed windows on public reads before falling back to KV", async () => {
+  it("returns 503 when snapshot loading fails at the SQL layer", async () => {
+    const env = createEnv({
+      db: new RecordingSqlConnection().when(LOAD_PUBLIC_SNAPSHOT_SQL, () => {
+        throw new Error("snapshot select failed");
+      }),
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/public/status"),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "snapshot_unavailable",
+    });
+    expect(listServicesWithComponents).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 when the stored snapshot payload cannot be parsed", async () => {
+    const env = createEnv({
+      db: new RecordingSqlConnection().when(LOAD_PUBLIC_SNAPSHOT_SQL, () => [
+        { payload: "{not-valid-json" },
+      ]),
+    });
+
+    const response = await worker.fetch(
+      new Request("https://flarestatus.test/api/public/status"),
+      env,
+      createCtx(),
+    );
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "snapshot_unavailable",
+    });
+    expect(listServicesWithComponents).not.toHaveBeenCalled();
+  });
+
+  it("reads the stored snapshot without recomputing timed windows on public reads", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-27T10:45:00.000Z"));
-    const kvPut = vi.fn(async () => undefined);
 
     const env = createEnv({
-      snapshot: {
-        generatedAt: "2026-04-27T10:00:00.000Z",
-        summary: { status: "operational" },
-        announcements: [],
-        services: [],
-      },
       db: createTimedWindowDb({
+        snapshot: {
+          generatedAt: "2026-04-27T10:00:00.000Z",
+          summary: { status: "operational" },
+          announcements: [],
+          services: [],
+        },
         overrides: [],
         announcements: [
           createAnnouncementRow({
@@ -706,7 +909,6 @@ describe("public status route", () => {
           }),
         ],
       }),
-      kvPut,
     });
 
     const response = await worker.fetch(
@@ -717,19 +919,13 @@ describe("public status route", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      generatedAt: "2026-04-27T10:45:00.000Z",
-      announcements: [
-        {
-          id: "ann_future",
-          title: "Scheduled maintenance",
-          body: "API traffic may be intermittently unavailable.",
-        },
-      ],
+      generatedAt: "2026-04-27T10:00:00.000Z",
+      announcements: [],
     });
-    expect(kvPut).toHaveBeenCalledTimes(1);
+    expect(listServicesWithComponents).not.toHaveBeenCalled();
   });
 
-  it("omits disabled services and components when recomputing the public route", async () => {
+  it("serves the stored snapshot without recomputing against the live catalog", async () => {
     listServicesWithComponents.mockResolvedValue({
       services: [
         createServiceRow({
@@ -771,13 +967,32 @@ describe("public status route", () => {
         }),
       ],
     });
-    listLatestProbeResults.mockResolvedValue([]);
 
     const response = await worker.fetch(
       new Request("https://flarestatus.test/api/public/status"),
       createEnv({
-        db: createTimedWindowDb({ overrides: [], announcements: [] }),
-        kvPut: async () => undefined,
+        snapshot: {
+          generatedAt: "2026-04-27T10:00:00.000Z",
+          summary: { status: "operational" },
+          announcements: [],
+          services: [
+            {
+              id: "svc_1",
+              slug: "sub2api",
+              name: "Sub2API",
+              status: "operational",
+              components: [
+                {
+                  id: "cmp_1",
+                  serviceId: "svc_1",
+                  slug: "sub2api-health",
+                  name: "Sub2API Health",
+                  displayStatus: "operational",
+                },
+              ],
+            },
+          ],
+        },
       }),
       createCtx(),
     );
@@ -802,6 +1017,7 @@ describe("public status route", () => {
     expect(payload.services).toHaveLength(1);
     expect(payload.services[0]?.components).toHaveLength(1);
     expect(payload.services[0]?.components[0]?.slug).toBe("sub2api-health");
+    expect(listServicesWithComponents).not.toHaveBeenCalled();
   });
 });
 
@@ -1168,60 +1384,57 @@ describe("admin console shell", () => {
 describe("public snapshot recomputation", () => {
   it("applies only active timed overrides and keeps announcement title shape", async () => {
     const nowIso = "2026-04-27T10:00:00.000Z";
-    const kvPut = vi.fn();
+    const db = createTimedWindowDb({
+      overrides: [
+        createOverrideRow({
+          id: "ovr_active",
+          override_status: "degraded",
+          starts_at: "2026-04-27T09:00:00.000Z",
+          ends_at: "2026-04-27T11:00:00.000Z",
+          created_at: "2026-04-27T09:45:00.000Z",
+        }),
+        createOverrideRow({
+          id: "ovr_future",
+          override_status: "major_outage",
+          starts_at: "2026-04-27T10:30:00.000Z",
+          ends_at: "2026-04-27T11:30:00.000Z",
+          created_at: "2026-04-27T09:50:00.000Z",
+        }),
+      ],
+      announcements: [
+        createAnnouncementRow({
+          id: "ann_active",
+          title: "Scheduled maintenance",
+          body: "API traffic may be intermittently unavailable.",
+          starts_at: "2026-04-27T09:00:00.000Z",
+          ends_at: "2026-04-27T11:00:00.000Z",
+        }),
+        createAnnouncementRow({
+          id: "ann_expired",
+          title: "Expired maintenance",
+          body: "This should not be visible.",
+          starts_at: "2026-04-27T07:00:00.000Z",
+          ends_at: "2026-04-27T09:00:00.000Z",
+        }),
+      ],
+    });
 
     const snapshot = await recomputePublicStatus(
-      createTimedWindowDb({
-        overrides: [
-          createOverrideRow({
-            id: "ovr_active",
-            override_status: "degraded",
-            starts_at: "2026-04-27T09:00:00.000Z",
-            ends_at: "2026-04-27T11:00:00.000Z",
-            created_at: "2026-04-27T09:45:00.000Z",
-          }),
-          createOverrideRow({
-            id: "ovr_future",
-            override_status: "major_outage",
-            starts_at: "2026-04-27T10:30:00.000Z",
-            ends_at: "2026-04-27T11:30:00.000Z",
-            created_at: "2026-04-27T09:50:00.000Z",
-          }),
-        ],
-        announcements: [
-          createAnnouncementRow({
-            id: "ann_active",
-            title: "Scheduled maintenance",
-            body: "API traffic may be intermittently unavailable.",
-            starts_at: "2026-04-27T09:00:00.000Z",
-            ends_at: "2026-04-27T11:00:00.000Z",
-          }),
-          createAnnouncementRow({
-            id: "ann_expired",
-            title: "Expired maintenance",
-            body: "This should not be visible.",
-            starts_at: "2026-04-27T07:00:00.000Z",
-            ends_at: "2026-04-27T09:00:00.000Z",
-          }),
-        ],
-      }),
-      { put: kvPut } as unknown as KVNamespace,
+      db,
       nowIso,
     );
 
-    expect(persistStatusUpdates).toHaveBeenCalledWith(
-      expect.anything(),
-      {
-        componentRows: [
-          {
-            id: "cmp_1",
-            observedStatus: "operational",
-            displayStatus: "degraded",
-          },
-        ],
-        serviceRows: [{ id: "svc_1", status: "degraded" }],
-      },
-      nowIso,
+    expect((db as RecordingSqlConnection).log).toEqual(
+      expect.arrayContaining([
+        {
+          query: UPDATE_COMPONENT_STATUS_SQL,
+          params: ["operational", "degraded", nowIso, "cmp_1"],
+        },
+        {
+          query: UPDATE_SERVICE_STATUS_SQL,
+          params: ["degraded", nowIso, "svc_1"],
+        },
+      ]),
     );
 
     expect(snapshot.announcements).toEqual([
@@ -1232,12 +1445,16 @@ describe("public snapshot recomputation", () => {
       },
     ]);
     expect(snapshot.services[0]?.components[0]?.displayStatus).toBe("degraded");
-    expect(JSON.parse(kvPut.mock.calls[0][1] as string).announcements[0]).toEqual(
-      {
-        id: "ann_active",
-        title: "Scheduled maintenance",
-        body: "API traffic may be intermittently unavailable.",
-      },
-    );
+    await expect(
+      loadPublicSnapshot(db, CURRENT_PUBLIC_SNAPSHOT_KEY),
+    ).resolves.toMatchObject({
+      announcements: [
+        {
+          id: "ann_active",
+          title: "Scheduled maintenance",
+          body: "API traffic may be intermittently unavailable.",
+        },
+      ],
+    });
   });
 });

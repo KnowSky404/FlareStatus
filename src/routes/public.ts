@@ -1,24 +1,25 @@
 import type { Env } from "../lib/env";
-import { recomputePublicStatus } from "../lib/status-engine";
+import {
+  CURRENT_PUBLIC_SNAPSHOT_KEY,
+  loadPublicSnapshot,
+} from "../lib/snapshots";
 
 export async function handlePublicStatus(env: Env): Promise<Response> {
   const nowIso = new Date().toISOString();
+  let snapshot;
 
   try {
-    const snapshot = await recomputePublicStatus(
-      env.DB,
-      env.STATUS_SNAPSHOTS,
-      nowIso,
-    );
-
-    return Response.json(snapshot);
+    snapshot = await loadPublicSnapshot(env.DB, CURRENT_PUBLIC_SNAPSHOT_KEY);
   } catch (error) {
-    console.error("failed to recompute public status for public read", error);
+    console.error("failed to load public status snapshot", error);
+    return Response.json(
+      {
+        error: "snapshot_unavailable",
+        generatedAt: nowIso,
+      },
+      { status: 503 },
+    );
   }
-
-  const snapshot = await env.STATUS_SNAPSHOTS.get("public:current", {
-    type: "json",
-  });
 
   return Response.json(
     snapshot ?? {

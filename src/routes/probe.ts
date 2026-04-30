@@ -1,5 +1,11 @@
-import type { Env } from "../lib/env";
+import {
+  getAppDatabase,
+  getProbeApiToken,
+  type AppContext,
+  type Env,
+} from "../lib/env";
 import { recomputePublicStatus } from "../lib/status-engine";
+import { executeSql, type SqlConnection } from "../lib/sql";
 
 const PROBE_STATUSES = new Set([
   "operational",
@@ -18,6 +24,13 @@ interface ProbeReportPayload {
 
 const ISO_UTC_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const MAX_FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const INSERT_PROBE_RESULT_SQL = `INSERT INTO probe_results (id, component_id, probe_source, status, latency_ms, summary, checked_at)
+     SELECT $1, id, $2, $3, $4, $5, $6 FROM components WHERE slug = $7
+     RETURNING id`;
+
+interface ProbeInsertRow {
+  id: string;
+}
 
 function isValidCheckedAt(value: string): boolean {
   if (!ISO_UTC_TIMESTAMP.test(value)) {
@@ -69,14 +82,24 @@ function hasValidProbeAuthorization(auth: string | null, token: string): boolean
   return match?.[1] === token;
 }
 
+function getProbeSqlConnection(env: Env): SqlConnection | null {
+  const db = getAppDatabase(env);
+
+  if ("unsafe" in db && "begin" in db) {
+    return db;
+  }
+
+  return null;
+}
+
 export async function handleProbeReport(
   request: Request,
   env: Env,
-  ctx: ExecutionContext,
+  ctx: AppContext,
 ): Promise<Response> {
   const auth = request.headers.get("authorization");
 
-  if (!hasValidProbeAuthorization(auth, env.PROBE_API_TOKEN)) {
+  if (!hasValidProbeAuthorization(auth, getProbeApiToken(env))) {
     return new Response("unauthorized", { status: 401 });
   }
 
@@ -92,11 +115,16 @@ export async function handleProbeReport(
     return new Response("invalid payload", { status: 400 });
   }
 
-  const result = await env.DB.prepare(
-    `INSERT INTO probe_results (id, component_id, probe_source, status, latency_ms, summary, checked_at)
-     SELECT ?, id, ?, ?, ?, ?, ? FROM components WHERE slug = ?`,
-  )
-    .bind(
+  const db = getProbeSqlConnection(env);
+
+  if (!db) {
+    return new Response("probe ingest unavailable", { status: 503 });
+  }
+
+  const insertedRows = await executeSql<ProbeInsertRow[]>(
+    db,
+    INSERT_PROBE_RESULT_SQL,
+    [
       crypto.randomUUID(),
       "docker-probe",
       payload.status,
@@ -104,16 +132,16 @@ export async function handleProbeReport(
       payload.summary ?? "",
       payload.checkedAt,
       payload.componentSlug,
-    )
-    .run();
+    ],
+  );
 
-  if (result.meta.changes === 0) {
+  if (insertedRows.length === 0) {
     return new Response("component not found", { status: 404 });
   }
 
   const nowIso = new Date().toISOString();
-  ctx.waitUntil(
-    recomputePublicStatus(env.DB, env.STATUS_SNAPSHOTS, nowIso).catch((error) => {
+  ctx.defer(
+    recomputePublicStatus(db, nowIso).catch((error) => {
       console.error("probe ingest recompute failed", error);
     }),
   );
